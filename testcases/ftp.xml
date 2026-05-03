@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<cases>
+ <case id="1" name="ftp">
+  <curl_setopt>
+   <CURLOPT_URL><![CDATA[ftp.cluster014.ovh.net/]]></CURLOPT_URL>
+   <CURLOPT_USERPWD><![CDATA[nofreeze:QZTcNNgH]]></CURLOPT_USERPWD>
+  </curl_setopt>
+ <checks>
+  <matchpattern>
+   <pattern><![CDATA[/www/i]]></pattern>
+   <source>curl</source>
+  </matchpattern>
+ </checks>
+ </case>
+</cases>

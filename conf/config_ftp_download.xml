@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<config>
+ <debug>1</debug>
+ <curl_setopt>
+  <CURLOPT_FTPPORT>-</CURLOPT_FTPPORT>
+ </curl_setopt>
+ <testcases>
+  <testcase>testcases/ftp_download.xml</testcase>
+ </testcases>
+</config>

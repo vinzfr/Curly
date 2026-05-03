@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<cases>
+ <case id="1" name="gmail_atom">
+  <curl_setopt>
+   <CURLOPT_URL>https://mail.google.com/mail/feed/atom</CURLOPT_URL>
+   <CURLOPT_USERPWD><![CDATA[user:password]]></CURLOPT_USERPWD>
+  </curl_setopt>
+   <checks>
+    <status_code>
+    <code>401</code>
+   </status_code>
+   </checks>
+ </case>
+</cases>

@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<cases>
+ <case id="1" name="ip2geo">
+  <curl_setopt>
+   <CURLOPT_URL><![CDATA[http://ws.cdyne.com/ip2geo/ip2geo.asmx]]></CURLOPT_URL>
+   <CURLOPT_POST>true</CURLOPT_POST>	
+   <CURLOPT_HTTPHEADER><![CDATA[Content-Type: text/xml; charset=utf-8|SOAPAction: "http://ws.cdyne.com/ResolveIP"]]></CURLOPT_HTTPHEADER>
+   <CURLOPT_POSTFIELDS><![CDATA[<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <ResolveIP xmlns="http://ws.cdyne.com/">
+      <ipAddress>86.195.71.63</ipAddress>
+      <licenseKey>0</licenseKey>
+    </ResolveIP>
+  </soap:Body>
+</soap:Envelope>]]>
+   </CURLOPT_POSTFIELDS>
+  </curl_setopt>
+ <checks>
+ <status_code>
+  <code>200</code>
+ </status_code>
+ <matchpattern>
+   <pattern>/France/</pattern>
+   <source>curl</source>
+  </matchpattern>
+<matchpattern>
+   <pattern><![CDATA[/<CountryCode>FR<\/CountryCode>/]]></pattern>
+   <source>curl</source>
+  </matchpattern>
+   <parsepattern>
+   <pattern><![CDATA[/<CountryCode>(.*)<\/CountryCode>/]]></pattern>
+   <source>curl</source>
+  </parsepattern>
+  </checks>
+  </case>
+</cases>

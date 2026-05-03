@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<conf>
+ <debug>1</debug>
+ <testcases>
+  <testcase>testcases/gmail_httpauth.xml</testcase>
+ </testcases>
+</conf>

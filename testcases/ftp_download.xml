@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<cases>
+ <case id="1" name="ftp">
+  <curl_setopt>
+   <CURLOPT_URL>ftp.cluster014.ovh.net/playbar.angle.jpg</CURLOPT_URL>
+   <CURLOPT_USERPWD>nofreeze:QZTcNNgH</CURLOPT_USERPWD>
+   <CURLOPT_FILE>/tmp/playbar.angle.jpg</CURLOPT_FILE>
+  </curl_setopt>
+ <checks>
+ <status_code>
+  <code>226</code>
+  <onfail_status>WARNING</onfail_status>
+</status_code>
+ </checks>
+ </case>
+</cases>

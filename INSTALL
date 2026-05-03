@@ -1,0 +1,13 @@
+Requirements
+  PHP >= 8.1 with curl and json extensions
+  Node.js + Playwright (optional, for chromium source support)
+
+Installation
+  Create log directory : mkdir -p /var/log/Curly && chmod 775 /var/log/Curly
+  Writable tmp for cookies : /tmp must be writable (default on most systems)
+  Set timezone in php.ini : date.timezone = Europe/Paris
+  Check open_basedir in php.ini : must allow access to your log dir, tmp, and testcase files
+
+Usage
+  php Curly.php conf/config.xml
+

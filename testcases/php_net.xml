@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<cases>
+
+ <case id="1" name="php_net">
+  <curl_setopt>
+   <CURLOPT_URL>https://www.php.net</CURLOPT_URL>
+   <CURLOPT_CERTINFO>1</CURLOPT_CERTINFO>
+   <CURLOPT_SSL_VERIFYPEER>0</CURLOPT_SSL_VERIFYPEER>
+  </curl_setopt>
+ <checks>
+ <status_code>
+  <code>200</code>
+  <onfail_status>WARNING</onfail_status>
+ </status_code>
+ <response_time>
+  <time>2</time>
+ </response_time>
+  <matchpattern>
+   <pattern>/Get Involved/</pattern>
+   <source>curl</source>
+    <onfail_status>WARNING</onfail_status>
+  </matchpattern>
+  <matchpattern>
+   <pattern>/Set-Cookie/</pattern>
+   <source>curlverbose</source>
+    <onfail_status>WARNING</onfail_status>
+    <errormessage>0</errormessage>
+  </matchpattern>
+ <nomatchpattern>
+   <pattern>/nomatchpattern/</pattern>
+   <source>curl</source>
+  </nomatchpattern>
+  <matchpatterncount>
+   <pattern>/Get Involved/i</pattern>
+   <matchcount>1</matchcount>
+   <source>curl</source>
+  </matchpatterncount>
+  <parsepattern>
+   <pattern><![CDATA[/<link rel="alternate" type="(application\/atom\+xml)" href="(.*)" title="PHP Release feed">/]]></pattern>
+   <source>curl</source>
+  </parsepattern>
+  <primary_ip>
+   <ip>72.52.91.14</ip>
+  </primary_ip>
+  <redirect_count>
+   <count>1</count>
+  </redirect_count>
+  </checks>
+  </case>
+
+  <case id="2" name="php_feed">
+  <curl_setopt>
+   <!-- dynamic URL call with get_parsepattern function - @params: testcasefile:caseid:parsepatternid:patternid -->
+   <CURLOPT_URL>{get_parsepattern:php_net.xml:1:1:2}</CURLOPT_URL>
+   <CURLOPT_SSL_VERIFYPEER>0</CURLOPT_SSL_VERIFYPEER>
+  </curl_setopt>
+  <checks>
+   <status_code>
+    <code>200</code>
+    <onfail_status>WARNING</onfail_status>
+   </status_code>
+   <matchpattern>
+    <pattern>/There is a new PHP release in town/i</pattern>
+    <source>curl</source>
+   </matchpattern>
+   <primary_ip>
+    <ip>72.52.91.14</ip>
+   </primary_ip>
+ <response_time>
+  <time>2</time>
+ </response_time>
+  </checks>
+ </case>
+
+</cases>
