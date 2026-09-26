@@ -8,6 +8,15 @@
  * Usage: ./Curly.php config.xml
  *
  * Changes vs original:
+ *  - 2.1 hardening: close handles reliably with finally
+ *  - 2.1 hardening: validate PCRE patterns and surface runtime PCRE errors as UNKNOWN
+ *  - 2.1 hardening: require SimpleXML and use LIBXML_NONET
+ *  - 2.1 hardening: restrict cURL protocols to HTTP/HTTPS
+ *  - 2.1 hardening: Chromium rendering is cached and renderer failures become UNKNOWN
+ *  - 2.1 hardening: Chromium renderer path comes from trusted process environment, not XML
+ *  - 2.1 hardening: redact sensitive cURL options in debug output and logs
+ *  - 2.1 hardening: lock JSONL writes and use JSON_THROW_ON_ERROR
+ *  - 2.1 quality: resolve testcase paths relative to config.xml as a fallback
  *  - PHP 8.1+ required
  *  - Fixed $cURL → $this->cURL bug in CurlyCurlSetOpt (CURLOPT_HTTPAUTH branch)
  *  - Fixed regex '/.xml/' → '/\.xml/' in logfile derivation
@@ -32,13 +41,12 @@
  */
 class Curly
 {
-    private array  $Curly;
-    private        $cURL;
-    private array  $argv;
-    private string $xmlconfig;
-    private        $CurlOptStdErrHandle;
-    private        $CurlOptFileHandle;
-    private        $LogHandle;
+    private array $Curly = [];
+    private ?\CurlHandle $cURL = null;
+    private array $argv = [];
+    private string $xmlconfig = '';
+    private mixed $CurlOptStdErrHandle = false;
+    private mixed $CurlOptFileHandle = false;
 
     // ─────────────────────────────────────────────
     //  Entry point
@@ -55,7 +63,7 @@ class Curly
         $this->endtasks();
 
         if ($this->Curly['conf']['debug'] === 1) {
-            print_r($this->Curly);
+            print_r($this->redactSensitiveData($this->Curly));
         }
 
         echo $this->Curly['result']['output']['stdout'] . PHP_EOL;
@@ -83,6 +91,12 @@ class Curly
                 'CURLOPT_FOLLOWLOCATION' => 1,
                 'CURLOPT_CONNECTTIMEOUT' => 10,
                 'CURLOPT_TIMEOUT'        => 10,
+                'CURLOPT_PROTOCOLS'      => (defined('CURLPROTO_HTTP') && defined('CURLPROTO_HTTPS'))
+                    ? CURLPROTO_HTTP | CURLPROTO_HTTPS
+                    : 3,
+                'CURLOPT_REDIR_PROTOCOLS'=> (defined('CURLPROTO_HTTP') && defined('CURLPROTO_HTTPS'))
+                    ? CURLPROTO_HTTP | CURLPROTO_HTTPS
+                    : 3,
                 'CURLOPT_STDERR'         => 'php://memory',
                 'CURLOPT_COOKIEFILE'     => '',
                 'CURLOPT_COOKIEJAR'      => '',
@@ -98,6 +112,8 @@ class Curly
                 'CURLOPT_COOKIEFILE',
                 'CURLOPT_COOKIEJAR',
                 'CURLOPT_STDERR',
+                'CURLOPT_PROTOCOLS',
+                'CURLOPT_REDIR_PROTOCOLS',
             ],
             'case_name_filter'     => '/^[a-zA-Z0-9_-]+$/',
             'errormessage_filter'  => '/^[a-zA-Z0-9_\-\. ]+$/',
@@ -110,7 +126,7 @@ class Curly
             'cookiesdir'           => '/tmp',
             'output_ok_length'     => 'long',
             'logsdir'              => '/var/log/Curly',
-            'chromium_script'      => '/opt/curly-render.js', // path to headless renderer
+            'chromium_script'      => getenv('CURLY_CHROMIUM_SCRIPT') ?: '/opt/curly-render.js',
             'checks'               => [
                 'status_code',
                 'matchpattern',
@@ -124,7 +140,7 @@ class Curly
             ],
         ];
 
-        $this->Curly['version']             = '2.0';
+        $this->Curly['version']             = '2.1.0';
         $this->Curly['curlopt_constants']   = $this->loadPrefixedConstants('CURLOPT_');
         $this->Curly['curlauth_constants']  = $this->loadPrefixedConstants('CURLAUTH_');
         $this->Curly['curlinfo_constants']  = $this->loadPrefixedConstants('CURLINFO_');
@@ -177,6 +193,21 @@ class Curly
 
     private function CurlyPreChecks(): void
     {
+        if (count($this->argv) !== 2) {
+            $this->bail('Usage: ' . $this->argv[0] . ' config.xml');
+        }
+
+        $arg = $this->argv[1];
+
+        if ($arg === '-h' || $arg === '--help') {
+            echo 'Usage: ' . $this->argv[0] . ' config.xml' . PHP_EOL;
+            exit($this->Curly['conf']['exit_codes']['OK']);
+        }
+        if ($arg === '-v' || $arg === '--version') {
+            echo $this->argv[0] . ' version ' . $this->Curly['version'] . PHP_EOL;
+            exit($this->Curly['conf']['exit_codes']['OK']);
+        }
+
         if (version_compare(PHP_VERSION, '8.1.0', '<')) {
             $this->bail('PHP version >= 8.1.0 required - current: ' . PHP_VERSION);
         }
@@ -186,26 +217,19 @@ class Curly
         if (!extension_loaded('json')) {
             $this->bail('PHP json extension not loaded');
         }
-
-        if (count($this->argv) !== 2) {
-            $this->bail('Usage: ' . $this->argv[0] . ' config.xml');
+        if (!extension_loaded('simplexml')) {
+            $this->bail('PHP SimpleXML extension not loaded');
         }
 
-        $arg = $this->argv[1];
-
-        if ($arg === '-h') {
-            echo 'Usage: ' . $this->argv[0] . ' config.xml' . PHP_EOL;
-            exit($this->Curly['conf']['exit_codes']['OK']);
-        }
-        if ($arg === '-v') {
-            echo $this->argv[0] . ' version ' . $this->Curly['version'] . PHP_EOL;
-            exit($this->Curly['conf']['exit_codes']['OK']);
-        }
-        if (!file_exists($arg)) {
+        if (!is_file($arg)) {
             $this->bail('File ' . $arg . ' not found');
         }
+        if (!is_readable($arg)) {
+            $this->bail('File ' . $arg . ' not readable');
+        }
 
-        $this->xmlconfig = $arg;
+        $resolved = realpath($arg);
+        $this->xmlconfig = $resolved !== false ? $resolved : $arg;
     }
 
     // ─────────────────────────────────────────────
@@ -214,7 +238,7 @@ class Curly
 
     private function LoadXmlCnf(): void
     {
-        $XmlCnfRaw = simplexml_load_file($this->xmlconfig, null, LIBXML_NOCDATA);
+        $XmlCnfRaw = simplexml_load_file($this->xmlconfig, null, LIBXML_NOCDATA | LIBXML_NONET);
         if (!$XmlCnfRaw) {
             $this->bail('Failed loading ' . $this->xmlconfig);
         }
@@ -234,6 +258,11 @@ class Curly
         // --- testcases ---
         $testcaseList = $XmlCnf['testcases']['testcase'];
         foreach ((array)$testcaseList as $testcasefile) {
+            if (!is_string($testcasefile) || trim($testcasefile) === '') {
+                $this->bail('Invalid testcase path in ' . $this->xmlconfig);
+            }
+
+            $testcasefile = $this->resolveTestcasePath(trim($testcasefile));
             if (in_array($testcasefile, $this->Curly['conf']['testcases'], true)) {
                 $this->bail($testcasefile . ' already used');
             }
@@ -255,7 +284,9 @@ class Curly
             }
             $this->Curly['conf']['logsdir'] = rtrim($dir, '/');
         }
-        $this->assertWritableDir($this->Curly['conf']['logsdir']);
+        if ($this->Curly['conf']['logenable']) {
+            $this->assertWritableDir($this->Curly['conf']['logsdir']);
+        }
 
         // --- output_ok_length ---
         if (isset($XmlCnf['output_ok_length']) && in_array($XmlCnf['output_ok_length'], ['short', 'long'], true)) {
@@ -287,10 +318,39 @@ class Curly
             }
         }
 
-        // --- chromium_script override ---
-        if (isset($XmlCnf['chromium_script']) && !empty($XmlCnf['chromium_script'])) {
-            $this->Curly['conf']['chromium_script'] = $XmlCnf['chromium_script'];
+        // --- chromium renderer path ---
+        // The executable script path is intentionally not configurable from XML:
+        // config/testcase files may be less trusted than the process environment.
+        // Use CURLY_CHROMIUM_SCRIPT=/path/to/curly-render.js when an override is needed.
+        if (isset($XmlCnf['chromium_script']) && trim((string)$XmlCnf['chromium_script']) !== '') {
+            $requested = trim((string)$XmlCnf['chromium_script']);
+            if ($requested !== $this->Curly['conf']['chromium_script']) {
+                $this->bail(
+                    'chromium_script can no longer be overridden from XML; use CURLY_CHROMIUM_SCRIPT instead'
+                );
+            }
         }
+    }
+
+    private function resolveTestcasePath(string $testcasefile): string
+    {
+        if (is_file($testcasefile)) {
+            $resolved = realpath($testcasefile);
+            return $resolved !== false ? $resolved : $testcasefile;
+        }
+
+        $isAbsolute = str_starts_with($testcasefile, '/')
+            || preg_match('/^[A-Za-z]:[\\\\\/]/', $testcasefile) === 1;
+
+        if (!$isAbsolute) {
+            $candidate = dirname($this->xmlconfig) . DIRECTORY_SEPARATOR . $testcasefile;
+            if (is_file($candidate)) {
+                $resolved = realpath($candidate);
+                return $resolved !== false ? $resolved : $candidate;
+            }
+        }
+
+        return $testcasefile;
     }
 
     // ─────────────────────────────────────────────
@@ -349,7 +409,7 @@ class Curly
 
     private function LoadXmlTestCase(string $testcasefile): \SimpleXMLElement
     {
-        $cases = simplexml_load_file($testcasefile, null, LIBXML_NOCDATA);
+        $cases = simplexml_load_file($testcasefile, null, LIBXML_NOCDATA | LIBXML_NONET);
         if (!$cases) {
             $this->bail('Failed loading ' . $testcasefile);
         }
@@ -561,6 +621,13 @@ class Curly
                 if (!str_starts_with($val, '/')) {
                     $this->bail('Case ' . $caseid . ' - ' . $checkname . ' - <' . $field . '> must include delimiters (e.g. /pattern/), got: ' . $val, $prefix);
                 }
+                if (@preg_match($val, '') === false) {
+                    $this->bail(
+                        'Case ' . $caseid . ' - ' . $checkname . ' - <' . $field
+                        . '> is not a valid PCRE pattern: ' . preg_last_error_msg(),
+                        $prefix
+                    );
+                }
                 break;
             case 'source':
                 if (!in_array($val, $allowedValues, true)) {
@@ -620,47 +687,59 @@ class Curly
             'curlverbose'     => '',
         ];
 
-        $this->cURL = curl_init();
-        $this->CurlyCurlSetOpt($testcasefile, $casekey, $case, $caseid);
+        $handle = curl_init();
+        if ($handle === false) {
+            $tc['is_unknown'] = 1;
+            $tc['output_unknown'] = 'curl_init failed';
+            return;
+        }
 
-        if ($tc['is_unknown']) {
-            $tc['curl'] = 'CurlyCurlSetOpt failed';
-            $tc['curlverbose'] = 'CurlyCurlSetOpt failed';
+        $this->cURL = $handle;
+
+        try {
+            $this->CurlyCurlSetOpt($testcasefile, $casekey, $case, $caseid);
+
+            if ($tc['is_unknown']) {
+                $tc['curl'] = 'CurlyCurlSetOpt failed';
+                $tc['curlverbose'] = 'CurlyCurlSetOpt failed';
+                return;
+            }
+
+            $cURLExec           = curl_exec($this->cURL);
+            $tc['curl_errno']   = curl_errno($this->cURL);
+            $tc['curl_getinfo'] = curl_getinfo($this->cURL);
+
+            $casetime = round((float)($tc['curl_getinfo']['total_time'] ?? 0), 4);
+            $this->Curly['result']['counters']['casestime'] += $casetime;
+
+            if (!isset($case['checks']['response_time'])) {
+                $this->Curly['result']['output']['perfdatas'] .= $casename . '=' . $casetime . ';0;0;0;0 ';
+            }
+
+            if (is_resource($this->CurlOptFileHandle)) {
+                fclose($this->CurlOptFileHandle);
+                $this->CurlOptFileHandle = false;
+            }
+
+            if (is_resource($this->CurlOptStdErrHandle)) {
+                rewind($this->CurlOptStdErrHandle);
+                $tc['curlverbose'] = stream_get_contents($this->CurlOptStdErrHandle) ?: '';
+                fclose($this->CurlOptStdErrHandle);
+                $this->CurlOptStdErrHandle = false;
+            }
+
+            if ($cURLExec === false) {
+                $tc['is_unknown']     = 1;
+                $tc['curl']           = curl_error($this->cURL);
+                $tc['output_unknown'] = $tc['curl'] !== '' ? $tc['curl'] : 'curl_exec failed';
+                return;
+            }
+
+            $tc['curl'] = $cURLExec;
+            $this->ExecChecks($testcasefile, $casekey, $case, $caseid);
+        } finally {
             $this->closeHandles();
-            return;
         }
-
-        $cURLExec          = curl_exec($this->cURL);
-        $tc['curl_errno']  = curl_errno($this->cURL);
-        $tc['curl_getinfo'] = curl_getinfo($this->cURL);
-
-        $casetime = round($tc['curl_getinfo']['total_time'], 4);
-        $this->Curly['result']['counters']['casestime'] += $casetime;
-
-        if (!isset($case['checks']['response_time'])) {
-            $this->Curly['result']['output']['perfdatas'] .= $casename . '=' . $casetime . ';0;0;0;0 ';
-        }
-
-        if ($this->CurlOptFileHandle) {
-            fclose($this->CurlOptFileHandle);
-            $this->CurlOptFileHandle = false;
-        }
-
-        rewind($this->CurlOptStdErrHandle);
-        $tc['curlverbose'] = stream_get_contents($this->CurlOptStdErrHandle);
-        fclose($this->CurlOptStdErrHandle);
-        $this->CurlOptStdErrHandle = false;
-
-        if ($cURLExec === false) {
-            $tc['is_unknown']     = 1;
-            $tc['curl']           = curl_error($this->cURL);
-            $tc['output_unknown'] = $tc['curl'];
-            return;
-        }
-
-        $tc['curl'] = $cURLExec;
-        $this->ExecChecks($testcasefile, $casekey, $case, $caseid);
-        $this->closeHandles();
     }
 
     private function closeHandles(): void
@@ -687,19 +766,33 @@ class Curly
 
         // Apply global defaults
         foreach ($this->Curly['conf']['curl_setopt'] as $opt => $val) {
+            if (!isset($this->Curly['curlopt_constants'][$opt])) {
+                $tc['is_unknown']     = 1;
+                $tc['output_unknown'] = 'Unsupported cURL option: ' . $opt;
+                return;
+            }
+
             $tc['curl_setopt'][$opt] = $val;
 
             if ($opt === 'CURLOPT_STDERR') {
-                if (!$this->CurlOptStdErrHandle = fopen($val, 'w+')) {
+                $this->CurlOptStdErrHandle = fopen((string)$val, 'w+');
+                if (!is_resource($this->CurlOptStdErrHandle)) {
                     $tc['is_unknown']     = 1;
                     $tc['output_unknown'] = $opt . ' - ' . $val . ' fopen failed';
                     return;
                 }
-                curl_setopt($this->cURL, $this->Curly['curlopt_constants'][$opt], $this->CurlOptStdErrHandle);
+                if (!$this->setCurlOption($testcasefile, $casekey, $opt, $this->CurlOptStdErrHandle)) {
+                    return;
+                }
             } elseif ($opt === 'CURLOPT_HTTPHEADER') {
-                curl_setopt($this->cURL, $this->Curly['curlopt_constants'][$opt], explode('|', $val));
+                $headers = is_array($val) ? $val : explode('|', (string)$val);
+                if (!$this->setCurlOption($testcasefile, $casekey, $opt, $headers)) {
+                    return;
+                }
             } else {
-                curl_setopt($this->cURL, $this->Curly['curlopt_constants'][$opt], $val);
+                if (!$this->setCurlOption($testcasefile, $casekey, $opt, $val)) {
+                    return;
+                }
             }
         }
 
@@ -726,23 +819,65 @@ class Curly
             $tc['curl_setopt'][$opt] = $val;
 
             if ($opt === 'CURLOPT_HTTPHEADER') {
-                curl_setopt($this->cURL, $this->Curly['curlopt_constants'][$opt], explode('|', $val));
+                $headers = is_array($val) ? $val : explode('|', (string)$val);
+                if (!$this->setCurlOption($testcasefile, $casekey, $opt, $headers)) {
+                    return;
+                }
             } elseif ($opt === 'CURLOPT_HTTPAUTH') {
-                if (isset($this->Curly['curlauth_constants'][$val])) {
-                    // BUG FIX: was $cURL, now $this->cURL
-                    curl_setopt($this->cURL, $this->Curly['curlopt_constants'][$opt], $this->Curly['curlauth_constants'][$val]);
+                if (!isset($this->Curly['curlauth_constants'][$val])) {
+                    $tc['is_unknown']     = 1;
+                    $tc['output_unknown'] = $opt . ' - unknown auth method: ' . (string)$val;
+                    return;
+                }
+                if (!$this->setCurlOption(
+                    $testcasefile,
+                    $casekey,
+                    $opt,
+                    $this->Curly['curlauth_constants'][$val]
+                )) {
+                    return;
                 }
             } elseif ($opt === 'CURLOPT_FILE') {
-                if (!$this->CurlOptFileHandle = fopen($val, 'w')) {
+                $this->CurlOptFileHandle = fopen((string)$val, 'wb');
+                if (!is_resource($this->CurlOptFileHandle)) {
                     $tc['is_unknown']     = 1;
                     $tc['output_unknown'] = $opt . ' - ' . $val . ' fopen failed';
                     return;
                 }
-                curl_setopt($this->cURL, $this->Curly['curlopt_constants'][$opt], $this->CurlOptFileHandle);
+                if (!$this->setCurlOption($testcasefile, $casekey, $opt, $this->CurlOptFileHandle)) {
+                    return;
+                }
             } else {
-                curl_setopt($this->cURL, $this->Curly['curlopt_constants'][$opt], $val);
+                if (!$this->setCurlOption($testcasefile, $casekey, $opt, $val)) {
+                    return;
+                }
             }
         }
+    }
+
+    private function setCurlOption(
+        string $testcasefile,
+        int $casekey,
+        string $opt,
+        mixed $value
+    ): bool {
+        $tc = &$this->Curly['result']['testcases'][$testcasefile][$casekey];
+
+        try {
+            $ok = curl_setopt($this->cURL, $this->Curly['curlopt_constants'][$opt], $value);
+        } catch (\Throwable $e) {
+            $tc['is_unknown']     = 1;
+            $tc['output_unknown'] = $opt . ' - curl_setopt failed: ' . $e->getMessage();
+            return false;
+        }
+
+        if ($ok !== true) {
+            $tc['is_unknown']     = 1;
+            $tc['output_unknown'] = $opt . ' - curl_setopt failed';
+            return false;
+        }
+
+        return true;
     }
 
     private function get_parsepattern(
@@ -795,18 +930,23 @@ class Curly
                     $parsepatternid++;
                 }
 
-                [$status, $message] = match ($checkname) {
-                    'status_code'       => $this->check_statuscode($testcasefile, $casekey, $checkname, $checkkey, $args),
-                    'primary_ip'        => $this->check_primary_ip($testcasefile, $casekey, $checkname, $checkkey, $args),
-                    'redirect_count'    => $this->check_redirect_count($testcasefile, $casekey, $checkname, $checkkey, $args),
-                    'response_time'     => $this->check_response_time($testcasefile, $casekey, $checkname, $checkkey, $args),
-                    'matchpattern'      => $this->check_matchpattern($testcasefile, $casekey, $checkname, $checkkey, $args),
-                    'nomatchpattern'    => $this->check_nomatchpattern($testcasefile, $casekey, $checkname, $checkkey, $args),
-                    'parsepattern'      => $this->check_parsepattern($testcasefile, $casekey, $checkname, $checkkey, $args, $caseid, $parsepatternid),
-                    'matchpatterncount' => $this->check_matchpatterncount($testcasefile, $casekey, $checkname, $checkkey, $args),
-                    'md5sum'            => $this->check_md5sum($testcasefile, $casekey, $checkname, $checkkey, $args),
-                    default             => [3, 'Unknown check: ' . $checkname],
-                };
+                try {
+                    [$status, $message] = match ($checkname) {
+                        'status_code'       => $this->check_statuscode($testcasefile, $casekey, $checkname, $checkkey, $args),
+                        'primary_ip'        => $this->check_primary_ip($testcasefile, $casekey, $checkname, $checkkey, $args),
+                        'redirect_count'    => $this->check_redirect_count($testcasefile, $casekey, $checkname, $checkkey, $args),
+                        'response_time'     => $this->check_response_time($testcasefile, $casekey, $checkname, $checkkey, $args),
+                        'matchpattern'      => $this->check_matchpattern($testcasefile, $casekey, $checkname, $checkkey, $args),
+                        'nomatchpattern'    => $this->check_nomatchpattern($testcasefile, $casekey, $checkname, $checkkey, $args),
+                        'parsepattern'      => $this->check_parsepattern($testcasefile, $casekey, $checkname, $checkkey, $args, $caseid, $parsepatternid),
+                        'matchpatterncount' => $this->check_matchpatterncount($testcasefile, $casekey, $checkname, $checkkey, $args),
+                        'md5sum'            => $this->check_md5sum($testcasefile, $casekey, $checkname, $checkkey, $args),
+                        default             => [3, 'Unknown check: ' . $checkname],
+                    };
+                } catch (\Throwable $e) {
+                    $status  = 3;
+                    $message = $checkname . '=error:' . $e->getMessage();
+                }
 
                 $stop = $this->dispatchCheckResult($testcasefile, $casekey, $status, $message);
                 if ($stop) {
@@ -856,14 +996,14 @@ class Curly
 
     private function check_statuscode(string $f, int $k, string $name, int $ck, array $args): array
     {
-        $code   = $args['code'];
-        $info   = $this->Curly['result']['testcases'][$f][$k]['curl_getinfo'];
-        $result = $info['http_code'] ?? 'unknown';
+        $expected = (int)$args['code'];
+        $info     = $this->Curly['result']['testcases'][$f][$k]['curl_getinfo'];
+        $result   = isset($info['http_code']) ? (int)$info['http_code'] : null;
 
-        if ($result === 'unknown') {
+        if ($result === null) {
             $status  = 3;
             $message = $name . '=unknown';
-        } elseif ($result != $code) {
+        } elseif ($result !== $expected) {
             $status  = $this->onfailStatus($args);
             $message = $name . '=' . ($args['errormessage'] ?? $result);
         } else {
@@ -871,7 +1011,7 @@ class Curly
             $message = $name . '=' . $result;
         }
 
-        $this->storeCheckResult($f, $k, $name, $ck, ['code' => $code, 'result' => $result, 'message' => $message, 'status' => $status]);
+        $this->storeCheckResult($f, $k, $name, $ck, ['code' => $expected, 'result' => $result ?? 'unknown', 'message' => $message, 'status' => $status]);
         return [$status, $message];
     }
 
@@ -898,14 +1038,14 @@ class Curly
 
     private function check_redirect_count(string $f, int $k, string $name, int $ck, array $args): array
     {
-        $expected = $args['count'];
+        $expected = (int)$args['count'];
         $info     = $this->Curly['result']['testcases'][$f][$k]['curl_getinfo'];
-        $result   = $info['redirect_count'] ?? 'unknown';
+        $result   = isset($info['redirect_count']) ? (int)$info['redirect_count'] : null;
 
-        if ($result === 'unknown') {
+        if ($result === null) {
             $status  = 3;
             $message = $name . '=unknown';
-        } elseif ($result != $expected) {
+        } elseif ($result !== $expected) {
             $status  = $this->onfailStatus($args);
             $message = $name . '=' . ($args['errormessage'] ?? $result);
         } else {
@@ -913,7 +1053,7 @@ class Curly
             $message = $name . '=' . $result;
         }
 
-        $this->storeCheckResult($f, $k, $name, $ck, ['count' => $expected, 'result' => $result, 'message' => $message, 'status' => $status]);
+        $this->storeCheckResult($f, $k, $name, $ck, ['count' => $expected, 'result' => $result ?? 'unknown', 'message' => $message, 'status' => $status]);
         return [$status, $message];
     }
 
@@ -954,8 +1094,13 @@ class Curly
     {
         $source  = $this->resolveSource($f, $k, $args['source']);
         $pattern = $args['pattern'];
+        $match   = preg_match($pattern, $source, $matches);
 
-        if (preg_match($pattern, $source, $matches)) {
+        if ($match === false) {
+            $status  = 3;
+            $result  = '';
+            $message = $name . ($ck + 1) . '=regex_error:' . preg_last_error_msg();
+        } elseif ($match === 1) {
             $status  = 0;
             $result  = $matches[0];
             $message = $name . ($ck + 1) . '=' . strlen($matches[0]);
@@ -973,8 +1118,13 @@ class Curly
     {
         $source  = $this->resolveSource($f, $k, $args['source']);
         $pattern = $args['pattern'];
+        $match   = preg_match($pattern, $source, $matches);
 
-        if (preg_match($pattern, $source, $matches)) {
+        if ($match === false) {
+            $result  = '';
+            $status  = 3;
+            $message = $name . ($ck + 1) . '=regex_error:' . preg_last_error_msg();
+        } elseif ($match === 1) {
             $result  = $matches[0];
             $status  = $this->onfailStatus($args);
             $message = $name . ($ck + 1) . '=' . ($args['errormessage'] ?? strlen($matches[0]));
@@ -994,8 +1144,12 @@ class Curly
         $pattern = $args['pattern'];
         $result  = '';
         $errors  = 0;
+        $match   = preg_match($pattern, $source, $matches);
 
-        if (!preg_match($pattern, $source, $matches) || count($matches) < 2) {
+        if ($match === false) {
+            $status  = 3;
+            $message = $name . ($ck + 1) . '=regex_error:' . preg_last_error_msg();
+        } elseif ($match !== 1 || count($matches) < 2) {
             $status  = 3;
             $message = $name . ($ck + 1) . '=0';
         } else {
@@ -1027,13 +1181,20 @@ class Curly
         $source     = $this->resolveSource($f, $k, $args['source']);
         $pattern    = $args['pattern'];
         $matchcount = (int)$args['matchcount'];
+        $count      = preg_match_all($pattern, $source, $matches);
 
-        $count   = preg_match_all($pattern, $source, $matches) ? count($matches[0]) : 0;
-        $matched = ($count === $matchcount);
-        $status  = $matched ? 0 : $this->onfailStatus($args);
-        $message = $name . ($ck + 1) . '=' . ($matched ? $count : ($args['errormessage'] ?? $count));
+        if ($count === false) {
+            $status  = 3;
+            $message = $name . ($ck + 1) . '=regex_error:' . preg_last_error_msg();
+            $result  = 0;
+        } else {
+            $result  = $count;
+            $matched = ($count === $matchcount);
+            $status  = $matched ? 0 : $this->onfailStatus($args);
+            $message = $name . ($ck + 1) . '=' . ($matched ? $count : ($args['errormessage'] ?? $count));
+        }
 
-        $this->storeCheckResult($f, $k, $name, $ck, ['pattern' => $pattern, 'source' => $args['source'], 'matchcount' => $matchcount, 'result' => $count, 'message' => $message, 'status' => $status]);
+        $this->storeCheckResult($f, $k, $name, $ck, ['pattern' => $pattern, 'source' => $args['source'], 'matchcount' => $matchcount, 'result' => $result, 'message' => $message, 'status' => $status]);
         return [$status, $message];
     }
 
@@ -1099,30 +1260,73 @@ class Curly
 
     private function fetchChromiumSource(string $f, int $k): string
     {
+        $tc = &$this->Curly['result']['testcases'][$f][$k];
+
+        if (array_key_exists('chromium', $tc)) {
+            return (string)$tc['chromium'];
+        }
+
         $script = $this->Curly['conf']['chromium_script'];
-        $url    = $this->Curly['result']['testcases'][$f][$k]['curl_setopt']['CURLOPT_URL'] ?? '';
+        $url    = $tc['curl_setopt']['CURLOPT_URL'] ?? '';
 
-        if (!file_exists($script)) {
-            // Return empty string — check will fail as pattern won't match
-            $this->Curly['result']['testcases'][$f][$k]['chromium_error'] =
-                'chromium_script not found: ' . $script;
-            return '';
+        if (!is_file($script) || !is_readable($script)) {
+            $message = 'chromium_script not found or not readable: ' . $script;
+            $tc['chromium_error'] = $message;
+            throw new \RuntimeException($message);
         }
 
-        if (empty($url)) {
-            return '';
+        if (!is_string($url) || $url === '') {
+            $message = 'chromium source requires CURLOPT_URL';
+            $tc['chromium_error'] = $message;
+            throw new \RuntimeException($message);
         }
 
-        $cmd    = 'node ' . escapeshellarg($script) . ' ' . escapeshellarg($url) . ' 2>/dev/null';
-        $output = shell_exec($cmd);
-
-        if ($output === null) {
-            $this->Curly['result']['testcases'][$f][$k]['chromium_error'] = 'chromium render failed for ' . $url;
-            return '';
+        $scheme = strtolower((string)parse_url($url, PHP_URL_SCHEME));
+        if (!in_array($scheme, ['http', 'https'], true)) {
+            $message = 'chromium source only supports http/https URLs';
+            $tc['chromium_error'] = $message;
+            throw new \RuntimeException($message);
         }
 
-        // Cache it so multiple checks on the same case don't re-render
-        $this->Curly['result']['testcases'][$f][$k]['chromium'] = $output;
+        if (!function_exists('proc_open')) {
+            $message = 'proc_open is unavailable; Chromium renderer cannot be started';
+            $tc['chromium_error'] = $message;
+            throw new \RuntimeException($message);
+        }
+
+        $descriptors = [
+            0 => ['pipe', 'r'],
+            1 => ['pipe', 'w'],
+            2 => ['pipe', 'w'],
+        ];
+
+        $process = proc_open(['node', $script, $url], $descriptors, $pipes);
+        if (!is_resource($process)) {
+            $message = 'chromium render process could not be started';
+            $tc['chromium_error'] = $message;
+            throw new \RuntimeException($message);
+        }
+
+        fclose($pipes[0]);
+        $output = stream_get_contents($pipes[1]);
+        $stderr = stream_get_contents($pipes[2]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+
+        $exitCode = proc_close($process);
+
+        if ($exitCode !== 0 || $output === false || trim($output) === '') {
+            $detail = trim((string)$stderr);
+            if ($detail !== '') {
+                $detail = ': ' . substr(preg_replace('/\s+/', ' ', $detail), 0, 300);
+            }
+            $message = 'chromium render failed for ' . $this->redactUrl($url) . $detail;
+            $tc['chromium_error'] = $message;
+            throw new \RuntimeException($message);
+        }
+
+        // Cache the rendered DOM so several Chromium-backed checks do not re-render.
+        $tc['chromium'] = $output;
         return $output;
     }
 
@@ -1144,14 +1348,118 @@ class Curly
 
         if ($this->Curly['conf']['debug']) {
             echo PHP_EOL . 'Check: ' . $name . PHP_EOL;
-            print_r($data);
+            print_r($this->redactSensitiveData($data));
             echo PHP_EOL;
         }
     }
 
     private function XmlToArray(\SimpleXMLElement $xml): array
     {
-        return json_decode(json_encode($xml), true);
+        try {
+            $json = json_encode($xml, JSON_THROW_ON_ERROR);
+            $data = json_decode($json, true, 512, JSON_THROW_ON_ERROR);
+        } catch (\JsonException $e) {
+            $this->bail('XML conversion failed: ' . $e->getMessage());
+        }
+
+        if (!is_array($data)) {
+            $this->bail('XML conversion failed: expected an object/array structure');
+        }
+
+        return $data;
+    }
+
+    private function redactSensitiveData(mixed $value, ?string $key = null): mixed
+    {
+        $sensitiveKeys = [
+            'CURLOPT_USERPWD',
+            'CURLOPT_PROXYUSERPWD',
+            'CURLOPT_USERNAME',
+            'CURLOPT_PASSWORD',
+            'CURLOPT_PROXYUSERNAME',
+            'CURLOPT_PROXYPASSWORD',
+            'CURLOPT_COOKIE',
+            'CURLOPT_COOKIELIST',
+            'CURLOPT_POSTFIELDS',
+            'parsepattern_results',
+        ];
+
+        if ($key !== null && in_array($key, $sensitiveKeys, true)) {
+            return '***REDACTED***';
+        }
+
+        if ($key === 'parsepattern' && is_array($value)) {
+            foreach ($value as &$instance) {
+                if (is_array($instance) && array_key_exists('result', $instance)) {
+                    $instance['result'] = '***REDACTED***';
+                }
+            }
+            unset($instance);
+        }
+
+        if (is_array($value)) {
+            $redacted = [];
+            foreach ($value as $childKey => $childValue) {
+                if ($childKey === 'CURLOPT_HTTPHEADER') {
+                    $redacted[$childKey] = $this->redactHeaders($childValue);
+                    continue;
+                }
+                if (in_array((string)$childKey, ['url', 'redirect_url', 'CURLOPT_URL'], true) && is_string($childValue)) {
+                    $redacted[$childKey] = $this->redactUrl($childValue);
+                    continue;
+                }
+                $redacted[$childKey] = $this->redactSensitiveData($childValue, (string)$childKey);
+            }
+            return $redacted;
+        }
+
+        return $value;
+    }
+
+    private function redactHeaders(mixed $headers): mixed
+    {
+        if (is_array($headers)) {
+            return array_map(fn($header) => $this->redactHeaders($header), $headers);
+        }
+
+        if (!is_string($headers)) {
+            return $headers;
+        }
+
+        return preg_replace(
+            '/(^|[|\\r\\n])(Authorization|Proxy-Authorization|Cookie|Set-Cookie)\\s*:[^|\\r\\n]*/i',
+            '$1$2: ***REDACTED***',
+            $headers
+        );
+    }
+
+    private function redactUrl(string $url): string
+    {
+        $url = preg_replace(
+            '#^(https?://)([^/@:\\s]+):([^@\\s]+)@#i',
+            '$1$2:***REDACTED***@',
+            $url
+        );
+
+        return preg_replace_callback(
+            '/([?&](?:access_token|token|api[_-]?key|secret|password|passwd|signature|auth)=)[^&#]*/i',
+            static fn(array $m): string => $m[1] . '***REDACTED***',
+            $url
+        );
+    }
+
+    private function sanitizeChecksForLog(array $checks): array
+    {
+        if (isset($checks['parsepattern']) && is_array($checks['parsepattern'])) {
+            foreach ($checks['parsepattern'] as &$result) {
+                if (is_array($result) && array_key_exists('result', $result)) {
+                    $result['result'] = '***REDACTED***';
+                }
+            }
+            unset($result);
+        }
+
+        return $this->redactSensitiveData($checks);
     }
 
     private function assertWritableDir(string $dir): void
@@ -1255,9 +1563,9 @@ class Curly
         }
 
         $logpath = $this->Curly['conf']['logsdir'] . '/' . $this->Curly['conf']['logfile'];
-        $fh      = fopen($logpath, 'a');
+        $fh      = fopen($logpath, 'ab');
 
-        if (!$fh) {
+        if (!is_resource($fh)) {
             echo 'Curly UNKNOWN - ' . $logpath . ' fopen failed' . PHP_EOL;
             exit($this->Curly['conf']['exit_codes']['UNKNOWN']);
         }
@@ -1274,25 +1582,50 @@ class Curly
         foreach ($this->Curly['result']['testcases'] as $file => $cases) {
             foreach ($cases as $casekey => $tc) {
                 $entry['testcases'][] = [
-                    'file'        => $file,
-                    'caseid'      => $tc['caseid'],
-                    'casename'    => $tc['casename'],
-                    'curl_setopt' => $tc['curl_setopt'],
-                    'curl_getinfo' => $tc['curl_getinfo'],
-                    'checks'      => $tc['checks'],
-                    'is_ok'       => (int)(!$tc['is_warning'] && !$tc['is_critical'] && !$tc['is_unknown']),
-                    'is_warning'  => $tc['is_warning'],
-                    'is_critical' => $tc['is_critical'],
-                    'is_unknown'  => $tc['is_unknown'],
-                    // curl body and verbose output omitted by default to keep logs lean;
-                    // enable with debug=1 if needed
+                    'file'         => $file,
+                    'caseid'       => $tc['caseid'],
+                    'casename'     => $tc['casename'],
+                    'curl_setopt'  => $this->redactSensitiveData($tc['curl_setopt']),
+                    'curl_getinfo' => $this->redactSensitiveData($tc['curl_getinfo']),
+                    'checks'       => $this->sanitizeChecksForLog($tc['checks']),
+                    'is_ok'        => (int)(!$tc['is_warning'] && !$tc['is_critical'] && !$tc['is_unknown']),
+                    'is_warning'   => $tc['is_warning'],
+                    'is_critical'  => $tc['is_critical'],
+                    'is_unknown'   => $tc['is_unknown'],
+                    // Response body and verbose cURL trace are intentionally omitted.
                 ];
             }
         }
 
-        fwrite($fh, json_encode($entry, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . PHP_EOL);
+        if (!flock($fh, LOCK_EX)) {
+            fclose($fh);
+            echo 'Curly UNKNOWN - ' . $logpath . ' lock failed' . PHP_EOL;
+            exit($this->Curly['conf']['exit_codes']['UNKNOWN']);
+        }
+
+        try {
+            $line = json_encode(
+                $entry,
+                JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
+            ) . PHP_EOL;
+
+            $written = fwrite($fh, $line);
+            if ($written === false || $written !== strlen($line)) {
+                throw new \RuntimeException('write failed or was incomplete');
+            }
+
+            fflush($fh);
+        } catch (\Throwable $e) {
+            flock($fh, LOCK_UN);
+            fclose($fh);
+            echo 'Curly UNKNOWN - ' . $logpath . ' logging failed: ' . $e->getMessage() . PHP_EOL;
+            exit($this->Curly['conf']['exit_codes']['UNKNOWN']);
+        }
+
+        flock($fh, LOCK_UN);
         fclose($fh);
     }
+
 }
 
 $Curly = new Curly();
