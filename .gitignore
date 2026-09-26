@@ -2,3 +2,4 @@ reset.sh
 *~
 *.swp
 *.idea
+.DS_Store
