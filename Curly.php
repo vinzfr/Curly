@@ -87,6 +87,105 @@ final class HttpResult
     }
 }
 
+final class TestCaseResult
+{
+    public array $curlOptions = [];
+    public array $checks = [];
+
+    private bool $warning = false;
+    private bool $critical = false;
+    private bool $unknown = false;
+
+    private string $outputOk = '';
+    private string $outputWarning = '';
+    private string $outputCritical = '';
+    private string $outputUnknown = '';
+
+    public function __construct(
+        public readonly string $caseId,
+        public readonly string $caseName,
+    ) {
+    }
+
+    public function markUnknown(string $message): void
+    {
+        $this->unknown = true;
+        $this->outputUnknown .= $message;
+    }
+
+    public function recordCheck(CheckResult $result, bool $breakOnError): bool
+    {
+        return match ($result->status) {
+            CheckStatus::UNKNOWN => $this->recordUnknown($result->message),
+            CheckStatus::CRITICAL => $this->recordCritical($result->message, $breakOnError),
+            CheckStatus::WARNING => $this->recordWarning($result->message, $breakOnError),
+            CheckStatus::OK => $this->recordOk($result->message),
+        };
+    }
+
+    public function storeCheck(string $name, int $index, array $data): void
+    {
+        $this->checks[$name][$index] = $data;
+    }
+
+    public function isUnknown(): bool
+    {
+        return $this->unknown;
+    }
+
+    public function isCritical(): bool
+    {
+        return $this->critical;
+    }
+
+    public function isWarning(): bool
+    {
+        return $this->warning;
+    }
+
+    public function isOk(): bool
+    {
+        return !$this->warning && !$this->critical && !$this->unknown;
+    }
+
+    public function output(CheckStatus $status): string
+    {
+        return match ($status) {
+            CheckStatus::OK => $this->outputOk,
+            CheckStatus::WARNING => $this->outputWarning,
+            CheckStatus::CRITICAL => $this->outputCritical,
+            CheckStatus::UNKNOWN => $this->outputUnknown,
+        };
+    }
+
+    private function recordUnknown(string $message): bool
+    {
+        $this->outputUnknown .= $message . ' ';
+        $this->unknown = true;
+        return true;
+    }
+
+    private function recordCritical(string $message, bool $breakOnError): bool
+    {
+        $this->outputCritical .= $message . ' ';
+        $this->critical = true;
+        return $breakOnError;
+    }
+
+    private function recordWarning(string $message, bool $breakOnError): bool
+    {
+        $this->outputWarning .= $message . ' ';
+        $this->warning = true;
+        return $breakOnError;
+    }
+
+    private function recordOk(string $message): bool
+    {
+        $this->outputOk .= $message . ' ';
+        return false;
+    }
+}
+
 /**
  * Curly - HTTP monitoring plugin for Nagios/Icinga
  * Style: Webinject (Perl) reimplemented in PHP
@@ -130,6 +229,8 @@ class Curly
     private array $Curly = [];
     /** @var array<string, array<int, HttpResult>> */
     private array $httpResults = [];
+    /** @var array<string, array<int, TestCaseResult>> */
+    private array $testCaseResults = [];
     private ?\CurlHandle $cURL = null;
     private array $argv = [];
     private string $xmlconfig = '';
@@ -151,7 +252,9 @@ class Curly
         $this->endtasks();
 
         if ($this->Curly['conf']['debug'] === 1) {
-            print_r($this->redactSensitiveData($this->Curly));
+            $debug = $this->Curly;
+            $debug['result']['testcases'] = $this->testCaseResultsForDebug();
+            print_r($this->redactSensitiveData($debug));
         }
 
         echo $this->Curly['result']['output']['stdout'] . PHP_EOL;
@@ -259,7 +362,6 @@ class Curly
                 'checksunknown'   => 0,
             ],
             'exit_status' => 0,
-            'testcases'   => [],
         ];
     }
 
@@ -469,27 +571,31 @@ class Curly
             foreach ($cases as $casekey => $case) {
                 $casename = $case['@attributes']['name'] . ' ';
                 $this->RunCase($testcasefile, $casekey, $case);
-                $tc = $this->Curly['result']['testcases'][$testcasefile][$casekey];
+                $tc = $this->caseResult($testcasefile, $casekey);
 
-                if ($tc['is_unknown']) {
+                if ($tc->isUnknown()) {
                     $this->Curly['result']['counters']['casesunknown']++;
-                    $this->Curly['result']['output']['UNKNOWN'] .= $casename . $tc['output_unknown'];
+                    $this->Curly['result']['output']['UNKNOWN'] .=
+                        $casename . $tc->output(CheckStatus::UNKNOWN);
                     return;
-                } elseif ($tc['is_critical']) {
+                } elseif ($tc->isCritical()) {
                     $this->Curly['result']['counters']['casescritical']++;
-                    $this->Curly['result']['output']['CRITICAL'] .= $casename . $tc['output_critical'];
+                    $this->Curly['result']['output']['CRITICAL'] .=
+                        $casename . $tc->output(CheckStatus::CRITICAL);
                     if ($this->Curly['conf']['break_on_error']) {
                         return;
                     }
-                } elseif ($tc['is_warning']) {
+                } elseif ($tc->isWarning()) {
                     $this->Curly['result']['counters']['caseswarning']++;
-                    $this->Curly['result']['output']['WARNING'] .= $casename . $tc['output_warning'];
+                    $this->Curly['result']['output']['WARNING'] .=
+                        $casename . $tc->output(CheckStatus::WARNING);
                     if ($this->Curly['conf']['break_on_error']) {
                         return;
                     }
                 } else {
                     $this->Curly['result']['counters']['casesok']++;
-                    $this->Curly['result']['output']['OK'] .= $casename . $tc['output_ok'];
+                    $this->Curly['result']['output']['OK'] .=
+                        $casename . $tc->output(CheckStatus::OK);
                 }
             }
         }
@@ -753,29 +859,16 @@ class Curly
 
     private function RunCase(string $testcasefile, int $casekey, array $case): void
     {
-        $caseid   = $case['@attributes']['id'];
-        $casename = $case['@attributes']['name'];
+        $caseid   = (string)$case['@attributes']['id'];
+        $casename = (string)$case['@attributes']['name'];
 
         $this->Curly['result']['counters']['casesrun']++;
-        $tc = &$this->Curly['result']['testcases'][$testcasefile][$casekey];
-        $tc = [
-            'caseid'          => $caseid,
-            'casename'        => $casename,
-            'is_warning'      => 0,
-            'is_critical'     => 0,
-            'is_unknown'      => 0,
-            'output_ok'       => '',
-            'output_warning'  => '',
-            'output_critical' => '',
-            'output_unknown'  => '',
-            'curl_setopt'     => [],
-            'checks'          => [],
-        ];
+        $tc = new TestCaseResult($caseid, $casename);
+        $this->testCaseResults[$testcasefile][$casekey] = $tc;
 
         $handle = curl_init();
         if ($handle === false) {
-            $tc['is_unknown'] = 1;
-            $tc['output_unknown'] = 'curl_init failed';
+            $tc->markUnknown('curl_init failed');
             return;
         }
 
@@ -784,7 +877,7 @@ class Curly
         try {
             $this->CurlyCurlSetOpt($testcasefile, $casekey, $case, $caseid);
 
-            if ($tc['is_unknown']) {
+            if ($tc->isUnknown()) {
                 return;
             }
 
@@ -819,14 +912,14 @@ class Curly
             $this->Curly['result']['counters']['casestime'] += $casetime;
 
             if (!isset($case['checks']['response_time'])) {
-                $this->Curly['result']['output']['perfdatas'] .= $casename . '=' . $casetime . ';0;0;0;0 ';
+                $this->Curly['result']['output']['perfdatas'] .=
+                    $casename . '=' . $casetime . ';0;0;0;0 ';
             }
 
             if ($cURLExec === false) {
-                $tc['is_unknown'] = 1;
-                $tc['output_unknown'] = $httpResult->error !== ''
-                    ? $httpResult->error
-                    : 'curl_exec failed';
+                $tc->markUnknown(
+                    $httpResult->error !== '' ? $httpResult->error : 'curl_exec failed'
+                );
                 return;
             }
 
@@ -854,23 +947,20 @@ class Curly
     {
         $this->CurlOptStdErrHandle = false;
         $this->CurlOptFileHandle   = false;
-        $tc = &$this->Curly['result']['testcases'][$testcasefile][$casekey];
+        $tc = $this->caseResult($testcasefile, $casekey);
 
-        // Apply global defaults
         foreach ($this->Curly['conf']['curl_setopt'] as $opt => $val) {
             if (!isset($this->Curly['curlopt_constants'][$opt])) {
-                $tc['is_unknown']     = 1;
-                $tc['output_unknown'] = 'Unsupported cURL option: ' . $opt;
+                $tc->markUnknown('Unsupported cURL option: ' . $opt);
                 return;
             }
 
-            $tc['curl_setopt'][$opt] = $val;
+            $tc->curlOptions[$opt] = $val;
 
             if ($opt === 'CURLOPT_STDERR') {
                 $this->CurlOptStdErrHandle = fopen((string)$val, 'w+');
                 if (!is_resource($this->CurlOptStdErrHandle)) {
-                    $tc['is_unknown']     = 1;
-                    $tc['output_unknown'] = $opt . ' - ' . $val . ' fopen failed';
+                    $tc->markUnknown($opt . ' - ' . $val . ' fopen failed');
                     return;
                 }
                 if (!$this->setCurlOption($testcasefile, $casekey, $opt, $this->CurlOptStdErrHandle)) {
@@ -888,7 +978,6 @@ class Curly
             }
         }
 
-        // Apply case-level overrides
         foreach ($case['curl_setopt'] as $opt => $val) {
             if (!isset($this->Curly['curlopt_constants'][$opt])) {
                 continue;
@@ -897,18 +986,17 @@ class Curly
                 continue;
             }
 
-            // Resolve get_parsepattern tokens in values
             if (is_string($val) && preg_match_all('/{get_parsepattern:/', $val, $m)) {
                 $requests = count($m[0]);
-                [$val, $status, $message] = $this->get_parsepattern($testcasefile, $caseid, $opt, $val, $requests);
+                [$val, $status, $message] =
+                    $this->get_parsepattern($testcasefile, $caseid, $opt, $val, $requests);
                 if ($status === 3) {
-                    $tc['is_unknown']     = 1;
-                    $tc['output_unknown'] = $message;
+                    $tc->markUnknown($message);
                     return;
                 }
             }
 
-            $tc['curl_setopt'][$opt] = $val;
+            $tc->curlOptions[$opt] = $val;
 
             if ($opt === 'CURLOPT_HTTPHEADER') {
                 $headers = is_array($val) ? $val : explode('|', (string)$val);
@@ -917,8 +1005,7 @@ class Curly
                 }
             } elseif ($opt === 'CURLOPT_HTTPAUTH') {
                 if (!isset($this->Curly['curlauth_constants'][$val])) {
-                    $tc['is_unknown']     = 1;
-                    $tc['output_unknown'] = $opt . ' - unknown auth method: ' . (string)$val;
+                    $tc->markUnknown($opt . ' - unknown auth method: ' . (string)$val);
                     return;
                 }
                 if (!$this->setCurlOption(
@@ -932,8 +1019,7 @@ class Curly
             } elseif ($opt === 'CURLOPT_FILE') {
                 $this->CurlOptFileHandle = fopen((string)$val, 'wb');
                 if (!is_resource($this->CurlOptFileHandle)) {
-                    $tc['is_unknown']     = 1;
-                    $tc['output_unknown'] = $opt . ' - ' . $val . ' fopen failed';
+                    $tc->markUnknown($opt . ' - ' . $val . ' fopen failed');
                     return;
                 }
                 if (!$this->setCurlOption($testcasefile, $casekey, $opt, $this->CurlOptFileHandle)) {
@@ -953,19 +1039,17 @@ class Curly
         string $opt,
         mixed $value
     ): bool {
-        $tc = &$this->Curly['result']['testcases'][$testcasefile][$casekey];
+        $tc = $this->caseResult($testcasefile, $casekey);
 
         try {
             $ok = curl_setopt($this->cURL, $this->Curly['curlopt_constants'][$opt], $value);
         } catch (\Throwable $e) {
-            $tc['is_unknown']     = 1;
-            $tc['output_unknown'] = $opt . ' - curl_setopt failed: ' . $e->getMessage();
+            $tc->markUnknown($opt . ' - curl_setopt failed: ' . $e->getMessage());
             return false;
         }
 
         if ($ok !== true) {
-            $tc['is_unknown']     = 1;
-            $tc['output_unknown'] = $opt . ' - curl_setopt failed';
+            $tc->markUnknown($opt . ' - curl_setopt failed');
             return false;
         }
 
@@ -1050,49 +1134,23 @@ class Curly
     }
 
     /**
-     * Record a check result into the right bucket and return true if execution should stop.
+     * Record a check result into the case object and return true if execution should stop.
      */
     private function dispatchCheckResult(string $testcasefile, int $casekey, CheckResult $result): bool
     {
-        $tc = &$this->Curly['result']['testcases'][$testcasefile][$casekey];
+        $tc = $this->caseResult($testcasefile, $casekey);
 
-        return match ($result->status) {
-            CheckStatus::UNKNOWN => $this->recordUnknownCheck($tc, $result->message),
-            CheckStatus::CRITICAL => $this->recordCriticalCheck($tc, $result->message),
-            CheckStatus::WARNING => $this->recordWarningCheck($tc, $result->message),
-            CheckStatus::OK => $this->recordOkCheck($tc, $result->message),
+        match ($result->status) {
+            CheckStatus::UNKNOWN => $this->Curly['result']['counters']['checksunknown']++,
+            CheckStatus::CRITICAL => $this->Curly['result']['counters']['checkscritical']++,
+            CheckStatus::WARNING => $this->Curly['result']['counters']['checkswarning']++,
+            CheckStatus::OK => $this->Curly['result']['counters']['checksok']++,
         };
-    }
 
-    private function recordUnknownCheck(array &$tc, string $message): bool
-    {
-        $tc['output_unknown'] .= $message . ' ';
-        $tc['is_unknown'] = 1;
-        $this->Curly['result']['counters']['checksunknown']++;
-        return true;
-    }
-
-    private function recordCriticalCheck(array &$tc, string $message): bool
-    {
-        $tc['output_critical'] .= $message . ' ';
-        $tc['is_critical'] = 1;
-        $this->Curly['result']['counters']['checkscritical']++;
-        return (bool)$this->Curly['conf']['break_on_error'];
-    }
-
-    private function recordWarningCheck(array &$tc, string $message): bool
-    {
-        $tc['output_warning'] .= $message . ' ';
-        $tc['is_warning'] = 1;
-        $this->Curly['result']['counters']['checkswarning']++;
-        return (bool)$this->Curly['conf']['break_on_error'];
-    }
-
-    private function recordOkCheck(array &$tc, string $message): bool
-    {
-        $tc['output_ok'] .= $message . ' ';
-        $this->Curly['result']['counters']['checksok']++;
-        return false;
+        return $tc->recordCheck(
+            $result,
+            (bool)$this->Curly['conf']['break_on_error']
+        );
     }
 
     // ─────────────────────────────────────────────
@@ -1188,7 +1246,7 @@ class Curly
             $message = $name . '=unknown';
         } else {
             $casetime = round($value, 4);
-            $casename = $this->Curly['result']['testcases'][$f][$k]['casename'];
+            $casename = $this->caseResult($f, $k)->caseName;
 
             if ($critTime !== null && $value > $critTime) {
                 $status  = $this->onfailStatus($args, CheckStatus::CRITICAL);
@@ -1425,9 +1483,9 @@ class Curly
             return $cached;
         }
 
-        $tc     = &$this->Curly['result']['testcases'][$f][$k];
+        $tc     = $this->caseResult($f, $k);
         $script = $this->Curly['conf']['chromium_script'];
-        $url    = $tc['curl_setopt']['CURLOPT_URL'] ?? '';
+        $url    = $tc->curlOptions['CURLOPT_URL'] ?? '';
 
         if (!is_file($script) || !is_readable($script)) {
             $message = 'chromium_script not found or not readable: ' . $script;
@@ -1503,6 +1561,41 @@ class Curly
         return $result;
     }
 
+    private function caseResult(string $f, int $k): TestCaseResult
+    {
+        $result = $this->testCaseResults[$f][$k] ?? null;
+        if (!$result instanceof TestCaseResult) {
+            throw new \RuntimeException('Test case result unavailable for ' . $f . ' case ' . $k);
+        }
+
+        return $result;
+    }
+
+    private function testCaseResultsForDebug(): array
+    {
+        $result = [];
+
+        foreach ($this->testCaseResults as $file => $cases) {
+            foreach ($cases as $casekey => $tc) {
+                $result[$file][$casekey] = [
+                    'caseid'          => $tc->caseId,
+                    'casename'        => $tc->caseName,
+                    'is_warning'      => (int)$tc->isWarning(),
+                    'is_critical'     => (int)$tc->isCritical(),
+                    'is_unknown'      => (int)$tc->isUnknown(),
+                    'output_ok'       => $tc->output(CheckStatus::OK),
+                    'output_warning'  => $tc->output(CheckStatus::WARNING),
+                    'output_critical' => $tc->output(CheckStatus::CRITICAL),
+                    'output_unknown'  => $tc->output(CheckStatus::UNKNOWN),
+                    'curl_setopt'     => $tc->curlOptions,
+                    'checks'          => $tc->checks,
+                ];
+            }
+        }
+
+        return $result;
+    }
+
     private function onfailStatus(
         array $args,
         CheckStatus $default = CheckStatus::CRITICAL
@@ -1520,7 +1613,7 @@ class Curly
 
     private function storeCheckResult(string $f, int $k, string $name, int $ck, array $data): void
     {
-        $this->Curly['result']['testcases'][$f][$k]['checks'][$name][$ck] = $data;
+        $this->caseResult($f, $k)->storeCheck($name, $ck, $data);
 
         if ($this->Curly['conf']['debug']) {
             echo PHP_EOL . 'Check: ' . $name . PHP_EOL;
@@ -1755,21 +1848,21 @@ class Curly
             'testcases' => [],
         ];
 
-        foreach ($this->Curly['result']['testcases'] as $file => $cases) {
+        foreach ($this->testCaseResults as $file => $cases) {
             foreach ($cases as $casekey => $tc) {
                 $entry['testcases'][] = [
                     'file'         => $file,
-                    'caseid'       => $tc['caseid'],
-                    'casename'     => $tc['casename'],
-                    'curl_setopt'  => $this->redactSensitiveData($tc['curl_setopt']),
+                    'caseid'       => $tc->caseId,
+                    'casename'     => $tc->caseName,
+                    'curl_setopt'  => $this->redactSensitiveData($tc->curlOptions),
                     'curl_getinfo' => $this->redactSensitiveData(
                         ($this->httpResults[$file][$casekey] ?? null)?->info ?? []
                     ),
-                    'checks'       => $this->sanitizeChecksForLog($tc['checks']),
-                    'is_ok'        => (int)(!$tc['is_warning'] && !$tc['is_critical'] && !$tc['is_unknown']),
-                    'is_warning'   => $tc['is_warning'],
-                    'is_critical'  => $tc['is_critical'],
-                    'is_unknown'   => $tc['is_unknown'],
+                    'checks'       => $this->sanitizeChecksForLog($tc->checks),
+                    'is_ok'        => (int)$tc->isOk(),
+                    'is_warning'   => (int)$tc->isWarning(),
+                    'is_critical'  => (int)$tc->isCritical(),
+                    'is_unknown'   => (int)$tc->isUnknown(),
                     // Response body and verbose cURL trace are intentionally omitted.
                 ];
             }

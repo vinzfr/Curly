@@ -69,8 +69,39 @@ if ($http->chromium() !== "<html>rendered</html>") {
     fwrite(STDERR, "Unexpected HttpResult Chromium cache behavior\n");
     exit(1);
 }
+
+$case = new TestCaseResult("7", "typed-case");
+$case->curlOptions["CURLOPT_URL"] = "https://example.invalid/";
+$case->storeCheck("status_code", 0, ["status" => 0]);
+if (
+    $case->caseId !== "7"
+    || $case->caseName !== "typed-case"
+    || !$case->isOk()
+    || $case->curlOptions["CURLOPT_URL"] !== "https://example.invalid/"
+    || $case->checks["status_code"][0]["status"] !== 0
+) {
+    fwrite(STDERR, "Unexpected TestCaseResult base behavior\n");
+    exit(1);
+}
+if ($case->recordCheck(new CheckResult(CheckStatus::WARNING, "warn=1"), false)) {
+    fwrite(STDERR, "WARNING should not stop when break_on_error is disabled\n");
+    exit(1);
+}
+if (!$case->isWarning() || $case->output(CheckStatus::WARNING) !== "warn=1 ") {
+    fwrite(STDERR, "Unexpected TestCaseResult warning behavior\n");
+    exit(1);
+}
+$unknown = new TestCaseResult("8", "unknown-case");
+if (!$unknown->recordCheck(new CheckResult(CheckStatus::UNKNOWN, "unknown=1"), false)) {
+    fwrite(STDERR, "UNKNOWN must stop testcase execution\n");
+    exit(1);
+}
+if (!$unknown->isUnknown() || $unknown->output(CheckStatus::UNKNOWN) !== "unknown=1 ") {
+    fwrite(STDERR, "Unexpected TestCaseResult unknown behavior\n");
+    exit(1);
+}
 ' "$SCRIPT" || fail "typed check result model"
-pass "typed check result + HTTP result models"
+pass "typed check, HTTP and testcase result models"
 
 for ext in curl simplexml json; do
   if ! php -m | grep -qi "^${ext}$"; then
