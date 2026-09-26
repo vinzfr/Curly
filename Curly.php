@@ -9,12 +9,81 @@ enum CheckStatus: int
     case UNKNOWN = 3;
 }
 
-final readonly class CheckResult
+final class CheckResult
 {
     public function __construct(
-        public CheckStatus $status,
-        public string $message,
+        public readonly CheckStatus $status,
+        public readonly string $message,
     ) {
+    }
+}
+
+final class HttpResult
+{
+    private ?string $chromium = null;
+    private ?string $chromiumError = null;
+
+    public function __construct(
+        public readonly string $body,
+        public readonly array $info,
+        public readonly int $errno,
+        public readonly string $verbose,
+        public readonly string $error = '',
+    ) {
+    }
+
+    public function httpCode(): ?int
+    {
+        $value = $this->info['http_code'] ?? null;
+        return is_numeric($value) ? (int)$value : null;
+    }
+
+    public function primaryIp(): ?string
+    {
+        $value = $this->info['primary_ip'] ?? null;
+        return is_string($value) && $value !== '' ? $value : null;
+    }
+
+    public function redirectCount(): ?int
+    {
+        $value = $this->info['redirect_count'] ?? null;
+        return is_numeric($value) ? (int)$value : null;
+    }
+
+    public function totalTime(): ?float
+    {
+        $value = $this->info['total_time'] ?? null;
+        return is_numeric($value) ? (float)$value : null;
+    }
+
+    public function source(string $source): string
+    {
+        return match ($source) {
+            'curl' => $this->body,
+            'curlverbose' => $this->verbose,
+            default => '',
+        };
+    }
+
+    public function chromium(): ?string
+    {
+        return $this->chromium;
+    }
+
+    public function cacheChromium(string $html): void
+    {
+        $this->chromium = $html;
+        $this->chromiumError = null;
+    }
+
+    public function chromiumError(): ?string
+    {
+        return $this->chromiumError;
+    }
+
+    public function failChromium(string $message): void
+    {
+        $this->chromiumError = $message;
     }
 }
 
@@ -59,6 +128,8 @@ final readonly class CheckResult
 class Curly
 {
     private array $Curly = [];
+    /** @var array<string, array<int, HttpResult>> */
+    private array $httpResults = [];
     private ?\CurlHandle $cURL = null;
     private array $argv = [];
     private string $xmlconfig = '';
@@ -698,10 +769,7 @@ class Curly
             'output_critical' => '',
             'output_unknown'  => '',
             'curl_setopt'     => [],
-            'curl_getinfo'    => [],
             'checks'          => [],
-            'curl'            => '',
-            'curlverbose'     => '',
         ];
 
         $handle = curl_init();
@@ -717,42 +785,51 @@ class Curly
             $this->CurlyCurlSetOpt($testcasefile, $casekey, $case, $caseid);
 
             if ($tc['is_unknown']) {
-                $tc['curl'] = 'CurlyCurlSetOpt failed';
-                $tc['curlverbose'] = 'CurlyCurlSetOpt failed';
                 return;
             }
 
-            $cURLExec           = curl_exec($this->cURL);
-            $tc['curl_errno']   = curl_errno($this->cURL);
-            $tc['curl_getinfo'] = curl_getinfo($this->cURL);
-
-            $casetime = round((float)($tc['curl_getinfo']['total_time'] ?? 0), 4);
-            $this->Curly['result']['counters']['casestime'] += $casetime;
-
-            if (!isset($case['checks']['response_time'])) {
-                $this->Curly['result']['output']['perfdatas'] .= $casename . '=' . $casetime . ';0;0;0;0 ';
-            }
+            $cURLExec = curl_exec($this->cURL);
+            $errno    = curl_errno($this->cURL);
+            $info     = curl_getinfo($this->cURL);
+            $error    = $cURLExec === false ? curl_error($this->cURL) : '';
 
             if (is_resource($this->CurlOptFileHandle)) {
                 fclose($this->CurlOptFileHandle);
                 $this->CurlOptFileHandle = false;
             }
 
+            $verbose = '';
             if (is_resource($this->CurlOptStdErrHandle)) {
                 rewind($this->CurlOptStdErrHandle);
-                $tc['curlverbose'] = stream_get_contents($this->CurlOptStdErrHandle) ?: '';
+                $verbose = stream_get_contents($this->CurlOptStdErrHandle) ?: '';
                 fclose($this->CurlOptStdErrHandle);
                 $this->CurlOptStdErrHandle = false;
             }
 
+            $httpResult = new HttpResult(
+                body: $cURLExec === false ? '' : (string)$cURLExec,
+                info: is_array($info) ? $info : [],
+                errno: $errno,
+                verbose: $verbose,
+                error: $error,
+            );
+            $this->httpResults[$testcasefile][$casekey] = $httpResult;
+
+            $casetime = round($httpResult->totalTime() ?? 0.0, 4);
+            $this->Curly['result']['counters']['casestime'] += $casetime;
+
+            if (!isset($case['checks']['response_time'])) {
+                $this->Curly['result']['output']['perfdatas'] .= $casename . '=' . $casetime . ';0;0;0;0 ';
+            }
+
             if ($cURLExec === false) {
-                $tc['is_unknown']     = 1;
-                $tc['curl']           = curl_error($this->cURL);
-                $tc['output_unknown'] = $tc['curl'] !== '' ? $tc['curl'] : 'curl_exec failed';
+                $tc['is_unknown'] = 1;
+                $tc['output_unknown'] = $httpResult->error !== ''
+                    ? $httpResult->error
+                    : 'curl_exec failed';
                 return;
             }
 
-            $tc['curl'] = $cURLExec;
             $this->ExecChecks($testcasefile, $casekey, $case, $caseid);
         } finally {
             $this->closeHandles();
@@ -1025,8 +1102,7 @@ class Curly
     private function check_statuscode(string $f, int $k, string $name, int $ck, array $args): CheckResult
     {
         $expected = (int)$args['code'];
-        $info     = $this->Curly['result']['testcases'][$f][$k]['curl_getinfo'];
-        $value    = isset($info['http_code']) ? (int)$info['http_code'] : null;
+        $value    = $this->httpResult($f, $k)->httpCode();
 
         if ($value === null) {
             $status  = CheckStatus::UNKNOWN;
@@ -1052,10 +1128,9 @@ class Curly
     private function check_primary_ip(string $f, int $k, string $name, int $ck, array $args): CheckResult
     {
         $ip     = $args['ip'];
-        $info   = $this->Curly['result']['testcases'][$f][$k]['curl_getinfo'];
-        $value  = $info['primary_ip'] ?? 'unknown';
+        $value  = $this->httpResult($f, $k)->primaryIp();
 
-        if ($value === 'unknown') {
+        if ($value === null) {
             $status  = CheckStatus::UNKNOWN;
             $message = $name . '=unknown';
         } elseif ($value !== $ip) {
@@ -1068,7 +1143,7 @@ class Curly
 
         $this->storeCheckResult($f, $k, $name, $ck, [
             'ip' => $ip,
-            'result' => $value,
+            'result' => $value ?? 'unknown',
             'message' => $message,
             'status' => $status->value,
         ]);
@@ -1079,8 +1154,7 @@ class Curly
     private function check_redirect_count(string $f, int $k, string $name, int $ck, array $args): CheckResult
     {
         $expected = (int)$args['count'];
-        $info     = $this->Curly['result']['testcases'][$f][$k]['curl_getinfo'];
-        $value    = isset($info['redirect_count']) ? (int)$info['redirect_count'] : null;
+        $value    = $this->httpResult($f, $k)->redirectCount();
 
         if ($value === null) {
             $status  = CheckStatus::UNKNOWN;
@@ -1105,12 +1179,11 @@ class Curly
 
     private function check_response_time(string $f, int $k, string $name, int $ck, array $args): CheckResult
     {
-        $info     = $this->Curly['result']['testcases'][$f][$k]['curl_getinfo'];
         $warnTime = (float)$args['time'];
         $critTime = isset($args['crit_time']) ? (float)$args['crit_time'] : null;
-        $value    = $info['total_time'] ?? 'unknown';
+        $value    = $this->httpResult($f, $k)->totalTime();
 
-        if ($value === 'unknown') {
+        if ($value === null) {
             $status  = CheckStatus::UNKNOWN;
             $message = $name . '=unknown';
         } else {
@@ -1134,7 +1207,7 @@ class Curly
 
         $this->storeCheckResult($f, $k, $name, $ck, [
             'time' => $warnTime,
-            'result' => $value,
+            'result' => $value ?? 'unknown',
             'message' => $message,
             'status' => $status->value,
         ]);
@@ -1290,7 +1363,7 @@ class Curly
     private function check_md5sum(string $f, int $k, string $name, int $ck, array $args): CheckResult
     {
         $expected = strtolower($args['hash']);
-        $body     = $this->Curly['result']['testcases'][$f][$k]['curl'];
+        $body     = $this->httpResult($f, $k)->body;
         $value    = md5($body);
 
         if ($value === $expected) {
@@ -1340,42 +1413,44 @@ class Curly
         if ($source === 'chromium') {
             return $this->fetchChromiumSource($f, $k);
         }
-        return $this->Curly['result']['testcases'][$f][$k][$source] ?? '';
+
+        return $this->httpResult($f, $k)->source($source);
     }
 
     private function fetchChromiumSource(string $f, int $k): string
     {
-        $tc = &$this->Curly['result']['testcases'][$f][$k];
-
-        if (array_key_exists('chromium', $tc)) {
-            return (string)$tc['chromium'];
+        $http = $this->httpResult($f, $k);
+        $cached = $http->chromium();
+        if ($cached !== null) {
+            return $cached;
         }
 
+        $tc     = &$this->Curly['result']['testcases'][$f][$k];
         $script = $this->Curly['conf']['chromium_script'];
         $url    = $tc['curl_setopt']['CURLOPT_URL'] ?? '';
 
         if (!is_file($script) || !is_readable($script)) {
             $message = 'chromium_script not found or not readable: ' . $script;
-            $tc['chromium_error'] = $message;
+            $http->failChromium($message);
             throw new \RuntimeException($message);
         }
 
         if (!is_string($url) || $url === '') {
             $message = 'chromium source requires CURLOPT_URL';
-            $tc['chromium_error'] = $message;
+            $http->failChromium($message);
             throw new \RuntimeException($message);
         }
 
         $scheme = strtolower((string)parse_url($url, PHP_URL_SCHEME));
         if (!in_array($scheme, ['http', 'https'], true)) {
             $message = 'chromium source only supports http/https URLs';
-            $tc['chromium_error'] = $message;
+            $http->failChromium($message);
             throw new \RuntimeException($message);
         }
 
         if (!function_exists('proc_open')) {
             $message = 'proc_open is unavailable; Chromium renderer cannot be started';
-            $tc['chromium_error'] = $message;
+            $http->failChromium($message);
             throw new \RuntimeException($message);
         }
 
@@ -1388,7 +1463,7 @@ class Curly
         $process = proc_open(['node', $script, $url], $descriptors, $pipes);
         if (!is_resource($process)) {
             $message = 'chromium render process could not be started';
-            $tc['chromium_error'] = $message;
+            $http->failChromium($message);
             throw new \RuntimeException($message);
         }
 
@@ -1406,18 +1481,27 @@ class Curly
                 $detail = ': ' . substr(preg_replace('/\s+/', ' ', $detail), 0, 300);
             }
             $message = 'chromium render failed for ' . $this->redactUrl($url) . $detail;
-            $tc['chromium_error'] = $message;
+            $http->failChromium($message);
             throw new \RuntimeException($message);
         }
 
-        // Cache the rendered DOM so several Chromium-backed checks do not re-render.
-        $tc['chromium'] = $output;
+        $http->cacheChromium($output);
         return $output;
     }
 
     // ─────────────────────────────────────────────
     //  Helpers
     // ─────────────────────────────────────────────
+
+    private function httpResult(string $f, int $k): HttpResult
+    {
+        $result = $this->httpResults[$f][$k] ?? null;
+        if (!$result instanceof HttpResult) {
+            throw new \RuntimeException('HTTP result unavailable for ' . $f . ' case ' . $k);
+        }
+
+        return $result;
+    }
 
     private function onfailStatus(
         array $args,
@@ -1678,7 +1762,9 @@ class Curly
                     'caseid'       => $tc['caseid'],
                     'casename'     => $tc['casename'],
                     'curl_setopt'  => $this->redactSensitiveData($tc['curl_setopt']),
-                    'curl_getinfo' => $this->redactSensitiveData($tc['curl_getinfo']),
+                    'curl_getinfo' => $this->redactSensitiveData(
+                        ($this->httpResults[$file][$casekey] ?? null)?->info ?? []
+                    ),
                     'checks'       => $this->sanitizeChecksForLog($tc['checks']),
                     'is_ok'        => (int)(!$tc['is_warning'] && !$tc['is_critical'] && !$tc['is_unknown']),
                     'is_warning'   => $tc['is_warning'],

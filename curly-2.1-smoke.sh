@@ -40,8 +40,37 @@ if ($result->status !== CheckStatus::WARNING || $result->message !== "typed-resu
     fwrite(STDERR, "Unexpected CheckResult behavior\n");
     exit(1);
 }
+
+$http = new HttpResult(
+    body: "BODY",
+    info: [
+        "http_code" => 204,
+        "primary_ip" => "127.0.0.1",
+        "redirect_count" => 2,
+        "total_time" => 0.125,
+    ],
+    errno: 0,
+    verbose: "TRACE",
+);
+if (
+    $http->body !== "BODY"
+    || $http->source("curl") !== "BODY"
+    || $http->source("curlverbose") !== "TRACE"
+    || $http->httpCode() !== 204
+    || $http->primaryIp() !== "127.0.0.1"
+    || $http->redirectCount() !== 2
+    || abs(($http->totalTime() ?? 0.0) - 0.125) > 0.000001
+) {
+    fwrite(STDERR, "Unexpected HttpResult behavior\n");
+    exit(1);
+}
+$http->cacheChromium("<html>rendered</html>");
+if ($http->chromium() !== "<html>rendered</html>") {
+    fwrite(STDERR, "Unexpected HttpResult Chromium cache behavior\n");
+    exit(1);
+}
 ' "$SCRIPT" || fail "typed check result model"
-pass "typed check result model"
+pass "typed check result + HTTP result models"
 
 for ext in curl simplexml json; do
   if ! php -m | grep -qi "^${ext}$"; then
