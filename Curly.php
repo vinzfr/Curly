@@ -1,6 +1,23 @@
 #!/usr/bin/env php
 <?php
 
+enum CheckStatus: int
+{
+    case OK = 0;
+    case WARNING = 1;
+    case CRITICAL = 2;
+    case UNKNOWN = 3;
+}
+
+final readonly class CheckResult
+{
+    public function __construct(
+        public CheckStatus $status,
+        public string $message,
+    ) {
+    }
+}
+
 /**
  * Curly - HTTP monitoring plugin for Nagios/Icinga
  * Style: Webinject (Perl) reimplemented in PHP
@@ -20,7 +37,7 @@
  *  - PHP 8.1+ required
  *  - Fixed $cURL → $this->cURL bug in CurlyCurlSetOpt (CURLOPT_HTTPAUTH branch)
  *  - Fixed regex '/.xml/' → '/\.xml/' in logfile derivation
- *  - Fixed missing curl_close() in closeHandles() — resource leak
+ *  - Curl handles are released reliably from a finally block
  *  - Fixed count($matches[0]) on string in check_nomatchpattern → strlen()
  *  - Fixed warnTime/critTime not cast to float in check_response_time
  *  - Fixed loose == → strict === in check_matchpatterncount
@@ -752,10 +769,8 @@ class Curly
             fclose($this->CurlOptFileHandle);
             $this->CurlOptFileHandle = false;
         }
-        if ($this->cURL !== null) {
-            @curl_close($this->cURL);
-            $this->cURL = null;
-        }
+        // CurlHandle resources are released when the object reference is dropped.
+        $this->cURL = null;
     }
 
     private function CurlyCurlSetOpt(string $testcasefile, int $casekey, array $case, $caseid): void
@@ -931,7 +946,7 @@ class Curly
                 }
 
                 try {
-                    [$status, $message] = match ($checkname) {
+                    $result = match ($checkname) {
                         'status_code'       => $this->check_statuscode($testcasefile, $casekey, $checkname, $checkkey, $args),
                         'primary_ip'        => $this->check_primary_ip($testcasefile, $casekey, $checkname, $checkkey, $args),
                         'redirect_count'    => $this->check_redirect_count($testcasefile, $casekey, $checkname, $checkkey, $args),
@@ -941,15 +956,16 @@ class Curly
                         'parsepattern'      => $this->check_parsepattern($testcasefile, $casekey, $checkname, $checkkey, $args, $caseid, $parsepatternid),
                         'matchpatterncount' => $this->check_matchpatterncount($testcasefile, $casekey, $checkname, $checkkey, $args),
                         'md5sum'            => $this->check_md5sum($testcasefile, $casekey, $checkname, $checkkey, $args),
-                        default             => [3, 'Unknown check: ' . $checkname],
+                        default             => new CheckResult(CheckStatus::UNKNOWN, 'Unknown check: ' . $checkname),
                     };
                 } catch (\Throwable $e) {
-                    $status  = 3;
-                    $message = $checkname . '=error:' . $e->getMessage();
+                    $result = new CheckResult(
+                        CheckStatus::UNKNOWN,
+                        $checkname . '=error:' . $e->getMessage()
+                    );
                 }
 
-                $stop = $this->dispatchCheckResult($testcasefile, $casekey, $status, $message);
-                if ($stop) {
+                if ($this->dispatchCheckResult($testcasefile, $casekey, $result)) {
                     return;
                 }
             }
@@ -959,224 +975,289 @@ class Curly
     /**
      * Record a check result into the right bucket and return true if execution should stop.
      */
-    private function dispatchCheckResult(string $testcasefile, int $casekey, int $status, string $message): bool
+    private function dispatchCheckResult(string $testcasefile, int $casekey, CheckResult $result): bool
     {
         $tc = &$this->Curly['result']['testcases'][$testcasefile][$casekey];
 
-        switch ($status) {
-            case 3:
-                $tc['output_unknown'] .= $message . ' ';
-                $tc['is_unknown'] = 1;
-                $this->Curly['result']['counters']['checksunknown']++;
-                return true;  // always stop on UNKNOWN
+        return match ($result->status) {
+            CheckStatus::UNKNOWN => $this->recordUnknownCheck($tc, $result->message),
+            CheckStatus::CRITICAL => $this->recordCriticalCheck($tc, $result->message),
+            CheckStatus::WARNING => $this->recordWarningCheck($tc, $result->message),
+            CheckStatus::OK => $this->recordOkCheck($tc, $result->message),
+        };
+    }
 
-            case 2:
-                $tc['output_critical'] .= $message . ' ';
-                $tc['is_critical'] = 1;
-                $this->Curly['result']['counters']['checkscritical']++;
-                return (bool)$this->Curly['conf']['break_on_error'];
+    private function recordUnknownCheck(array &$tc, string $message): bool
+    {
+        $tc['output_unknown'] .= $message . ' ';
+        $tc['is_unknown'] = 1;
+        $this->Curly['result']['counters']['checksunknown']++;
+        return true;
+    }
 
-            case 1:
-                $tc['output_warning'] .= $message . ' ';
-                $tc['is_warning'] = 1;
-                $this->Curly['result']['counters']['checkswarning']++;
-                return (bool)$this->Curly['conf']['break_on_error'];
+    private function recordCriticalCheck(array &$tc, string $message): bool
+    {
+        $tc['output_critical'] .= $message . ' ';
+        $tc['is_critical'] = 1;
+        $this->Curly['result']['counters']['checkscritical']++;
+        return (bool)$this->Curly['conf']['break_on_error'];
+    }
 
-            case 0:
-            default:
-                $tc['output_ok'] .= $message . ' ';
-                $this->Curly['result']['counters']['checksok']++;
-                return false;
-        }
+    private function recordWarningCheck(array &$tc, string $message): bool
+    {
+        $tc['output_warning'] .= $message . ' ';
+        $tc['is_warning'] = 1;
+        $this->Curly['result']['counters']['checkswarning']++;
+        return (bool)$this->Curly['conf']['break_on_error'];
+    }
+
+    private function recordOkCheck(array &$tc, string $message): bool
+    {
+        $tc['output_ok'] .= $message . ' ';
+        $this->Curly['result']['counters']['checksok']++;
+        return false;
     }
 
     // ─────────────────────────────────────────────
     //  Individual check implementations
     // ─────────────────────────────────────────────
 
-    private function check_statuscode(string $f, int $k, string $name, int $ck, array $args): array
+    private function check_statuscode(string $f, int $k, string $name, int $ck, array $args): CheckResult
     {
         $expected = (int)$args['code'];
         $info     = $this->Curly['result']['testcases'][$f][$k]['curl_getinfo'];
-        $result   = isset($info['http_code']) ? (int)$info['http_code'] : null;
+        $value    = isset($info['http_code']) ? (int)$info['http_code'] : null;
 
-        if ($result === null) {
-            $status  = 3;
+        if ($value === null) {
+            $status  = CheckStatus::UNKNOWN;
             $message = $name . '=unknown';
-        } elseif ($result !== $expected) {
+        } elseif ($value !== $expected) {
             $status  = $this->onfailStatus($args);
-            $message = $name . '=' . ($args['errormessage'] ?? $result);
+            $message = $name . '=' . ($args['errormessage'] ?? $value);
         } else {
-            $status  = 0;
-            $message = $name . '=' . $result;
+            $status  = CheckStatus::OK;
+            $message = $name . '=' . $value;
         }
 
-        $this->storeCheckResult($f, $k, $name, $ck, ['code' => $expected, 'result' => $result ?? 'unknown', 'message' => $message, 'status' => $status]);
-        return [$status, $message];
+        $this->storeCheckResult($f, $k, $name, $ck, [
+            'code' => $expected,
+            'result' => $value ?? 'unknown',
+            'message' => $message,
+            'status' => $status->value,
+        ]);
+
+        return new CheckResult($status, $message);
     }
 
-    private function check_primary_ip(string $f, int $k, string $name, int $ck, array $args): array
+    private function check_primary_ip(string $f, int $k, string $name, int $ck, array $args): CheckResult
     {
         $ip     = $args['ip'];
         $info   = $this->Curly['result']['testcases'][$f][$k]['curl_getinfo'];
-        $result = $info['primary_ip'] ?? 'unknown';
+        $value  = $info['primary_ip'] ?? 'unknown';
 
-        if ($result === 'unknown') {
-            $status  = 3;
+        if ($value === 'unknown') {
+            $status  = CheckStatus::UNKNOWN;
             $message = $name . '=unknown';
-        } elseif ($result !== $ip) {
+        } elseif ($value !== $ip) {
             $status  = $this->onfailStatus($args);
-            $message = $name . '=' . ($args['errormessage'] ?? $result);
+            $message = $name . '=' . ($args['errormessage'] ?? $value);
         } else {
-            $status  = 0;
-            $message = $name . '=' . $result;
+            $status  = CheckStatus::OK;
+            $message = $name . '=' . $value;
         }
 
-        $this->storeCheckResult($f, $k, $name, $ck, ['ip' => $ip, 'result' => $result, 'message' => $message, 'status' => $status]);
-        return [$status, $message];
+        $this->storeCheckResult($f, $k, $name, $ck, [
+            'ip' => $ip,
+            'result' => $value,
+            'message' => $message,
+            'status' => $status->value,
+        ]);
+
+        return new CheckResult($status, $message);
     }
 
-    private function check_redirect_count(string $f, int $k, string $name, int $ck, array $args): array
+    private function check_redirect_count(string $f, int $k, string $name, int $ck, array $args): CheckResult
     {
         $expected = (int)$args['count'];
         $info     = $this->Curly['result']['testcases'][$f][$k]['curl_getinfo'];
-        $result   = isset($info['redirect_count']) ? (int)$info['redirect_count'] : null;
+        $value    = isset($info['redirect_count']) ? (int)$info['redirect_count'] : null;
 
-        if ($result === null) {
-            $status  = 3;
+        if ($value === null) {
+            $status  = CheckStatus::UNKNOWN;
             $message = $name . '=unknown';
-        } elseif ($result !== $expected) {
+        } elseif ($value !== $expected) {
             $status  = $this->onfailStatus($args);
-            $message = $name . '=' . ($args['errormessage'] ?? $result);
+            $message = $name . '=' . ($args['errormessage'] ?? $value);
         } else {
-            $status  = 0;
-            $message = $name . '=' . $result;
+            $status  = CheckStatus::OK;
+            $message = $name . '=' . $value;
         }
 
-        $this->storeCheckResult($f, $k, $name, $ck, ['count' => $expected, 'result' => $result ?? 'unknown', 'message' => $message, 'status' => $status]);
-        return [$status, $message];
+        $this->storeCheckResult($f, $k, $name, $ck, [
+            'count' => $expected,
+            'result' => $value ?? 'unknown',
+            'message' => $message,
+            'status' => $status->value,
+        ]);
+
+        return new CheckResult($status, $message);
     }
 
-    private function check_response_time(string $f, int $k, string $name, int $ck, array $args): array
+    private function check_response_time(string $f, int $k, string $name, int $ck, array $args): CheckResult
     {
         $info     = $this->Curly['result']['testcases'][$f][$k]['curl_getinfo'];
         $warnTime = (float)$args['time'];
-        $critTime = isset($args['crit_time']) ? (float)$args['crit_time'] : null; // optional second threshold
-        $result   = $info['total_time'] ?? 'unknown';
+        $critTime = isset($args['crit_time']) ? (float)$args['crit_time'] : null;
+        $value    = $info['total_time'] ?? 'unknown';
 
-        if ($result === 'unknown') {
-            $status  = 3;
+        if ($value === 'unknown') {
+            $status  = CheckStatus::UNKNOWN;
             $message = $name . '=unknown';
         } else {
-            $casetime = round($result, 4);
+            $casetime = round($value, 4);
             $casename = $this->Curly['result']['testcases'][$f][$k]['casename'];
 
-            if ($critTime !== null && $result > $critTime) {
-                $status  = $this->onfailStatus($args, 2);
-                $message = $name . '=' . ($args['errormessage'] ?? $result);
-                $this->Curly['result']['output']['perfdatas'] .= $casename . '=' . $casetime . ';' . $warnTime . ';' . $critTime . ';0;0 ';
-            } elseif ($result > $warnTime) {
-                $status  = $this->onfailStatus($args, 1);
-                $message = $name . '=' . ($args['errormessage'] ?? $result);
-                $this->Curly['result']['output']['perfdatas'] .= $casename . '=' . $casetime . ';' . $warnTime . ';' . ($critTime ?? 0) . ';0;0 ';
+            if ($critTime !== null && $value > $critTime) {
+                $status  = $this->onfailStatus($args, CheckStatus::CRITICAL);
+                $message = $name . '=' . ($args['errormessage'] ?? $value);
+            } elseif ($value > $warnTime) {
+                $status  = $this->onfailStatus($args, CheckStatus::WARNING);
+                $message = $name . '=' . ($args['errormessage'] ?? $value);
             } else {
-                $status  = 0;
-                $message = $name . '=' . $result;
-                $this->Curly['result']['output']['perfdatas'] .= $casename . '=' . $casetime . ';' . $warnTime . ';' . ($critTime ?? 0) . ';0;0 ';
+                $status  = CheckStatus::OK;
+                $message = $name . '=' . $value;
             }
+
+            $this->Curly['result']['output']['perfdatas'] .=
+                $casename . '=' . $casetime . ';' . $warnTime . ';' . ($critTime ?? 0) . ';0;0 ';
         }
 
-        $this->storeCheckResult($f, $k, $name, $ck, ['time' => $warnTime, 'result' => $result, 'message' => $message, 'status' => $status]);
-        return [$status, $message];
+        $this->storeCheckResult($f, $k, $name, $ck, [
+            'time' => $warnTime,
+            'result' => $value,
+            'message' => $message,
+            'status' => $status->value,
+        ]);
+
+        return new CheckResult($status, $message);
     }
 
-    private function check_matchpattern(string $f, int $k, string $name, int $ck, array $args): array
+    private function check_matchpattern(string $f, int $k, string $name, int $ck, array $args): CheckResult
     {
         $source  = $this->resolveSource($f, $k, $args['source']);
         $pattern = $args['pattern'];
         $match   = preg_match($pattern, $source, $matches);
 
         if ($match === false) {
-            $status  = 3;
-            $result  = '';
+            $status  = CheckStatus::UNKNOWN;
+            $value   = '';
             $message = $name . ($ck + 1) . '=regex_error:' . preg_last_error_msg();
         } elseif ($match === 1) {
-            $status  = 0;
-            $result  = $matches[0];
+            $status  = CheckStatus::OK;
+            $value   = $matches[0];
             $message = $name . ($ck + 1) . '=' . strlen($matches[0]);
         } else {
-            $result  = '';
+            $value   = '';
             $status  = $this->onfailStatus($args);
             $message = $name . ($ck + 1) . '=' . ($args['errormessage'] ?? '0');
         }
 
-        $this->storeCheckResult($f, $k, $name, $ck, ['pattern' => $pattern, 'source' => $args['source'], 'result' => $result, 'message' => $message, 'status' => $status]);
-        return [$status, $message];
+        $this->storeCheckResult($f, $k, $name, $ck, [
+            'pattern' => $pattern,
+            'source' => $args['source'],
+            'result' => $value,
+            'message' => $message,
+            'status' => $status->value,
+        ]);
+
+        return new CheckResult($status, $message);
     }
 
-    private function check_nomatchpattern(string $f, int $k, string $name, int $ck, array $args): array
+    private function check_nomatchpattern(string $f, int $k, string $name, int $ck, array $args): CheckResult
     {
         $source  = $this->resolveSource($f, $k, $args['source']);
         $pattern = $args['pattern'];
         $match   = preg_match($pattern, $source, $matches);
 
         if ($match === false) {
-            $result  = '';
-            $status  = 3;
+            $value   = '';
+            $status  = CheckStatus::UNKNOWN;
             $message = $name . ($ck + 1) . '=regex_error:' . preg_last_error_msg();
         } elseif ($match === 1) {
-            $result  = $matches[0];
+            $value   = $matches[0];
             $status  = $this->onfailStatus($args);
             $message = $name . ($ck + 1) . '=' . ($args['errormessage'] ?? strlen($matches[0]));
         } else {
-            $result  = '';
-            $status  = 0;
+            $value   = '';
+            $status  = CheckStatus::OK;
             $message = $name . ($ck + 1) . '=0';
         }
 
-        $this->storeCheckResult($f, $k, $name, $ck, ['pattern' => $pattern, 'source' => $args['source'], 'result' => $result, 'message' => $message, 'status' => $status]);
-        return [$status, $message];
+        $this->storeCheckResult($f, $k, $name, $ck, [
+            'pattern' => $pattern,
+            'source' => $args['source'],
+            'result' => $value,
+            'message' => $message,
+            'status' => $status->value,
+        ]);
+
+        return new CheckResult($status, $message);
     }
 
-    private function check_parsepattern(string $f, int $k, string $name, int $ck, array $args, $caseid, int $parsepatternid): array
-    {
+    private function check_parsepattern(
+        string $f,
+        int $k,
+        string $name,
+        int $ck,
+        array $args,
+        $caseid,
+        int $parsepatternid
+    ): CheckResult {
         $source  = $this->resolveSource($f, $k, $args['source']);
         $pattern = $args['pattern'];
-        $result  = '';
+        $value   = '';
         $errors  = 0;
         $match   = preg_match($pattern, $source, $matches);
 
         if ($match === false) {
-            $status  = 3;
+            $status  = CheckStatus::UNKNOWN;
             $message = $name . ($ck + 1) . '=regex_error:' . preg_last_error_msg();
         } elseif ($match !== 1 || count($matches) < 2) {
-            $status  = 3;
+            $status  = CheckStatus::UNKNOWN;
             $message = $name . ($ck + 1) . '=0';
         } else {
             $nbmatches = count($matches);
             for ($patternid = 1; $patternid < $nbmatches; $patternid++) {
-                $val = $matches[$patternid];
-                if ($val !== '') {
-                    $this->Curly['parsepattern_results'][$f]['case'][$caseid][$parsepatternid][$patternid] = $val;
-                    $result .= $val . ' ';
+                $captured = $matches[$patternid];
+                if ($captured !== '') {
+                    $this->Curly['parsepattern_results'][$f]['case'][$caseid][$parsepatternid][$patternid] = $captured;
+                    $value .= $captured . ' ';
                 } else {
                     $errors++;
                 }
             }
+
             if ($errors === 0) {
-                $status  = 0;
+                $status  = CheckStatus::OK;
                 $message = $name . ($ck + 1) . '=' . ($nbmatches - 1);
             } else {
-                $status  = 3;
+                $status  = CheckStatus::UNKNOWN;
                 $message = $name . ($ck + 1) . '=' . ($nbmatches - 1 - $errors);
             }
         }
 
-        $this->storeCheckResult($f, $k, $name, $ck, ['pattern' => $pattern, 'source' => $args['source'], 'result' => trim($result), 'message' => $message, 'status' => $status]);
-        return [$status, $message];
+        $this->storeCheckResult($f, $k, $name, $ck, [
+            'pattern' => $pattern,
+            'source' => $args['source'],
+            'result' => trim($value),
+            'message' => $message,
+            'status' => $status->value,
+        ]);
+
+        return new CheckResult($status, $message);
     }
 
-    private function check_matchpatterncount(string $f, int $k, string $name, int $ck, array $args): array
+    private function check_matchpatterncount(string $f, int $k, string $name, int $ck, array $args): CheckResult
     {
         $source     = $this->resolveSource($f, $k, $args['source']);
         $pattern    = $args['pattern'];
@@ -1184,46 +1265,50 @@ class Curly
         $count      = preg_match_all($pattern, $source, $matches);
 
         if ($count === false) {
-            $status  = 3;
+            $status  = CheckStatus::UNKNOWN;
             $message = $name . ($ck + 1) . '=regex_error:' . preg_last_error_msg();
-            $result  = 0;
+            $value   = 0;
         } else {
-            $result  = $count;
+            $value   = $count;
             $matched = ($count === $matchcount);
-            $status  = $matched ? 0 : $this->onfailStatus($args);
+            $status  = $matched ? CheckStatus::OK : $this->onfailStatus($args);
             $message = $name . ($ck + 1) . '=' . ($matched ? $count : ($args['errormessage'] ?? $count));
         }
 
-        $this->storeCheckResult($f, $k, $name, $ck, ['pattern' => $pattern, 'source' => $args['source'], 'matchcount' => $matchcount, 'result' => $result, 'message' => $message, 'status' => $status]);
-        return [$status, $message];
+        $this->storeCheckResult($f, $k, $name, $ck, [
+            'pattern' => $pattern,
+            'source' => $args['source'],
+            'matchcount' => $matchcount,
+            'result' => $value,
+            'message' => $message,
+            'status' => $status->value,
+        ]);
+
+        return new CheckResult($status, $message);
     }
 
-    /**
-     * NEW: md5sum check
-     * Computes MD5 of the curl response body and compares to expected hash.
-     *
-     * XML:
-     *   <md5sum>
-     *     <hash>d41d8cd98f00b204e9800998ecf8427e</hash>
-     *     <onfail_status>CRITICAL</onfail_status>
-     *   </md5sum>
-     */
-    private function check_md5sum(string $f, int $k, string $name, int $ck, array $args): array
+    private function check_md5sum(string $f, int $k, string $name, int $ck, array $args): CheckResult
     {
         $expected = strtolower($args['hash']);
         $body     = $this->Curly['result']['testcases'][$f][$k]['curl'];
-        $result   = md5($body);
+        $value    = md5($body);
 
-        if ($result === $expected) {
-            $status  = 0;
-            $message = $name . '=' . $result;
+        if ($value === $expected) {
+            $status  = CheckStatus::OK;
+            $message = $name . '=' . $value;
         } else {
             $status  = $this->onfailStatus($args);
-            $message = $name . '=' . ($args['errormessage'] ?? 'got=' . $result . '_expected=' . $expected);
+            $message = $name . '=' . ($args['errormessage'] ?? 'got=' . $value . '_expected=' . $expected);
         }
 
-        $this->storeCheckResult($f, $k, $name, $ck, ['hash' => $expected, 'result' => $result, 'message' => $message, 'status' => $status]);
-        return [$status, $message];
+        $this->storeCheckResult($f, $k, $name, $ck, [
+            'hash' => $expected,
+            'result' => $value,
+            'message' => $message,
+            'status' => $status->value,
+        ]);
+
+        return new CheckResult($status, $message);
     }
 
     // ─────────────────────────────────────────────
@@ -1334,12 +1419,19 @@ class Curly
     //  Helpers
     // ─────────────────────────────────────────────
 
-    private function onfailStatus(array $args, int $default = 2): int
-    {
-        if (isset($args['onfail_status'])) {
-            return $this->Curly['conf']['exit_codes'][$args['onfail_status']];
+    private function onfailStatus(
+        array $args,
+        CheckStatus $default = CheckStatus::CRITICAL
+    ): CheckStatus {
+        if (!isset($args['onfail_status'])) {
+            return $default;
         }
-        return $default;
+
+        return match ($args['onfail_status']) {
+            'WARNING' => CheckStatus::WARNING,
+            'CRITICAL' => CheckStatus::CRITICAL,
+            default => $default,
+        };
     }
 
     private function storeCheckResult(string $f, int $k, string $name, int $ck, array $data): void
@@ -1628,5 +1720,7 @@ class Curly
 
 }
 
-$Curly = new Curly();
-$Curly->CurlyExec($argv);
+if (realpath($_SERVER['SCRIPT_FILENAME'] ?? '') === __FILE__) {
+    $Curly = new Curly();
+    $Curly->CurlyExec($argv);
+}

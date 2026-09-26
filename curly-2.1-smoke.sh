@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT="${1:-$(cd "$(dirname "$0")" && pwd)/Curly-2.1.php}"
+SCRIPT="${1:-$(cd "$(dirname "$0")" && pwd)/Curly.php}"
 
 fail() {
   echo "✗ $*" >&2
@@ -22,6 +22,26 @@ pass "version flag"
 help="$(php "$SCRIPT" --help)"
 [[ "$help" == *"Usage:"* ]] || fail "help flag"
 pass "help flag"
+
+php -r '
+require $argv[1];
+$expected = [
+    CheckStatus::OK->value,
+    CheckStatus::WARNING->value,
+    CheckStatus::CRITICAL->value,
+    CheckStatus::UNKNOWN->value,
+];
+if ($expected !== [0, 1, 2, 3]) {
+    fwrite(STDERR, "Unexpected CheckStatus values\n");
+    exit(1);
+}
+$result = new CheckResult(CheckStatus::WARNING, "typed-result");
+if ($result->status !== CheckStatus::WARNING || $result->message !== "typed-result") {
+    fwrite(STDERR, "Unexpected CheckResult behavior\n");
+    exit(1);
+}
+' "$SCRIPT" || fail "typed check result model"
+pass "typed check result model"
 
 for ext in curl simplexml json; do
   if ! php -m | grep -qi "^${ext}$"; then
