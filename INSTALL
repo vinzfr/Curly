@@ -1,5 +1,5 @@
 Requirements
-  PHP >= 8.1 with curl and json extensions
+  PHP >= 8.1 with curl, json and simplexml extensions
   Node.js + Playwright (optional, for chromium source support)
 
 Installation
@@ -7,7 +7,11 @@ Installation
   Writable tmp for cookies : /tmp must be writable (default on most systems)
   Set timezone in php.ini : date.timezone = Europe/Paris
   Check open_basedir in php.ini : must allow access to your log dir, tmp, and testcase files
+  Chromium source only: set CURLY_CHROMIUM_SCRIPT=/path/to/curly-render.js if not using /opt/curly-render.js
 
 Usage
-  php Curly.php conf/config.xml
+  chmod +x Curly.php
+  ./Curly.php --version
+  ./Curly.php --help
+  ./Curly.php conf/config.xml
 

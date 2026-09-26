@@ -2,7 +2,7 @@
 
 HTTP monitoring plugin for Nagios/Icinga, written in PHP.
 
-Curly runs multi-step HTTP scenarios defined in XML files and outputs a standard Nagios-compatible result with performance data. It is a drop-in replacement for `check_http` when you need authenticated flows, chained requests, or pattern-based assertions — with no dependency other than PHP and cURL.
+Curly runs multi-step HTTP scenarios defined in XML files and outputs a standard Nagios-compatible result with performance data. It is a drop-in replacement for `check_http` when you need authenticated flows, chained requests, or pattern-based assertions, with a small runtime footprint: PHP with cURL, JSON and SimpleXML.
 
 ```
 Curly OK - login=200 dashboard=200 |Curlytime=0.42;0;0;0;0 casesrun=2;0;0;0;0 ...
@@ -15,7 +15,7 @@ Curly CRITICAL - login status_code=403 |...
 ## Requirements
 
 - PHP 8.1 or later
-- PHP extensions: `curl`, `json`
+- PHP extensions: `curl`, `json`, `simplexml`
 - For the `chromium` source: Node.js + Playwright (`curly-render.js`, see below)
 
 ---
@@ -24,8 +24,8 @@ Curly CRITICAL - login status_code=403 |...
 
 ```bash
 chmod +x Curly.php
-./Curly.php -v        # print version
-./Curly.php -h        # print usage
+./Curly.php --version # print version (`-v` also works)
+./Curly.php --help    # print usage (`-h` also works)
 ./Curly.php config.xml
 ```
 
@@ -46,7 +46,7 @@ A Curly run uses two types of XML files.
 
 The **config file** (`config.xml`) is passed on the command line. It declares global settings and the list of testcase files to run.
 
-The **testcase files** each contain one or more HTTP request cases with their checks. Multiple testcase files run sequentially in the order they are declared.
+The **testcase files** each contain one or more HTTP request cases with their checks. Multiple testcase files run sequentially in the order they are declared. Relative testcase paths are resolved from the directory containing the main config file.
 
 ```
 config.xml          ← passed to Curly.php
@@ -79,7 +79,7 @@ Root element: `<config>` or `<conf>`
   <!-- Delete the cookie temp file after each run (default: 1) -->
   <deletecookies>1</deletecookies>
 
-  <!-- Print the full internal state to stdout (default: 0) -->
+  <!-- Print the internal state to stdout with sensitive values redacted (default: 0) -->
   <debug>0</debug>
 
   <!-- Log directory — must exist and be writable (default: /var/log/Curly) -->
@@ -90,9 +90,6 @@ Root element: `<config>` or `<conf>`
 
   <!-- 'long' includes check results in OK output, 'short' omits them (default: long) -->
   <output_ok_length>long</output_ok_length>
-
-  <!-- Path to the headless renderer script (default: /opt/curly-render.js) -->
-  <chromium_script>/opt/curly-render.js</chromium_script>
 
   <!-- Global cURL options applied to every case (overridable per case) -->
   <curl_setopt>
@@ -105,6 +102,8 @@ Root element: `<config>` or `<conf>`
 </config>
 ```
 
+The Chromium renderer path is intentionally not configurable from XML. Set the trusted process environment variable `CURLY_CHROMIUM_SCRIPT` when a path other than `/opt/curly-render.js` is required.
+
 ### Default cURL options
 
 | Option | Default |
@@ -115,7 +114,7 @@ Root element: `<config>` or `<conf>`
 | `CURLOPT_TIMEOUT` | `10` |
 | `CURLOPT_VERBOSE` | `1` (captured internally) |
 
-The following options cannot be overridden (used internally): `CURLOPT_RETURNTRANSFER`, `CURLOPT_VERBOSE`, `CURLOPT_HEADERFUNCTION`, `CURLOPT_WRITEFUNCTION`, `CURLOPT_WRITEHEADER`, `CURLOPT_READFUNCTION`, `CURLOPT_COOKIEFILE`, `CURLOPT_COOKIEJAR`, `CURLOPT_STDERR`.
+The following options cannot be overridden (used internally): `CURLOPT_RETURNTRANSFER`, `CURLOPT_VERBOSE`, `CURLOPT_HEADERFUNCTION`, `CURLOPT_WRITEFUNCTION`, `CURLOPT_WRITEHEADER`, `CURLOPT_READFUNCTION`, `CURLOPT_COOKIEFILE`, `CURLOPT_COOKIEJAR`, `CURLOPT_STDERR`. Curly restricts request protocols to HTTP and HTTPS.
 
 ---
 
@@ -366,7 +365,7 @@ Enable it by adding `<source>chromium</source>` to any pattern check:
 </matchpattern>
 ```
 
-Curly calls `node /opt/curly-render.js <URL>` (path overridable via `<chromium_script>` in the config). The script must print the rendered HTML to stdout and exit 0. A minimal Playwright implementation:
+Curly calls `node /opt/curly-render.js <URL>` by default. To use another trusted renderer path, set `CURLY_CHROMIUM_SCRIPT` in the process environment. The renderer path cannot be overridden from testcase XML. The script must print the rendered HTML to stdout and exit 0. A minimal Playwright implementation:
 
 ```js
 // /opt/curly-render.js
@@ -423,7 +422,7 @@ grep . /var/log/Curly/config.log | jq 'select(.status == 1)'
 jq '.testcases[] | select(.casename == "login") | .checks' /var/log/Curly/config.log
 ```
 
-Response body and cURL verbose output are omitted from logs by default to keep entries lean. Enable `debug=1` in the config to log the full internal state to stdout.
+Response body and cURL verbose output are omitted from logs by default to keep entries lean. Sensitive cURL options, authentication headers, cookies, token-like URL parameters, POST fields and parsed values are redacted from logs and debug output. Enable `debug=1` in the config to print the redacted internal state to stdout.
 
 ---
 
@@ -507,6 +506,23 @@ Response body and cURL verbose output are omitted from logs by default to keep e
 ---
 
 ## Changelog
+
+### v2.1
+
+**Hardening**
+- cURL and stream handles are released reliably from `finally`
+- PCRE patterns are validated before execution; runtime PCRE failures report UNKNOWN
+- SimpleXML is now an explicit runtime requirement and XML loading disables network access
+- cURL and Chromium requests are restricted to HTTP/HTTPS
+- Chromium renderer failures report UNKNOWN and rendered DOM is cached once per case
+- Chromium renderer path moved from XML configuration to trusted `CURLY_CHROMIUM_SCRIPT`
+- Sensitive credentials, headers, cookies, POST fields, token-like URL parameters and parsed values are redacted from debug output and JSONL logs
+- JSONL writes use file locking and exception-aware JSON encoding
+- Relative testcase paths are resolved from the main config file directory
+
+**Internal refactoring**
+- check outcomes use typed `CheckStatus` and `CheckResult` objects internally
+- `Curly.php` can be included by tests without automatically executing the CLI entry point
 
 ### v2.0
 
